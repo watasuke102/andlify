@@ -22,6 +22,29 @@ namespace {
 constexpr const char* kLogTag = "andlify-rootfs";
 constexpr const char* kReadyMarker = ".andlify_rootfs_ready";
 
+void LogErrno(const char* context, const std::string& path) {
+    const int error_code = errno;
+    __android_log_print(
+        ANDROID_LOG_ERROR,
+        kLogTag,
+        "%s: %s (errno=%d, %s)",
+        context,
+        path.c_str(),
+        error_code,
+        strerror(error_code));
+}
+
+void LogErrno(const char* context) {
+    const int error_code = errno;
+    __android_log_print(
+        ANDROID_LOG_ERROR,
+        kLogTag,
+        "%s (errno=%d, %s)",
+        context,
+        error_code,
+        strerror(error_code));
+}
+
 std::string JoinPath(const std::string& left, const std::string& right) {
     if (left.empty()) {
         return right;
@@ -43,55 +66,82 @@ std::string JoinPath(const std::string& left, const std::string& right) {
 
 bool EnsureDirectoryRecursive(const std::string& path) {
     if (path.empty()) {
+        __android_log_print(ANDROID_LOG_ERROR, kLogTag, "EnsureDirectoryRecursive: empty path");
         return false;
     }
-    if (path == "/") {
+
+    std::string normalized_path = path;
+    while (normalized_path.size() > 1 && normalized_path.back() == '/') {
+        normalized_path.pop_back();
+    }
+    if (normalized_path == "/") {
         return true;
     }
 
     struct stat st {};
-    if (stat(path.c_str(), &st) == 0) {
-        return S_ISDIR(st.st_mode);
-    }
-
-    std::string current;
-    current.reserve(path.size());
-    for (size_t i = 0; i < path.size(); ++i) {
-        current.push_back(path[i]);
-        if (path[i] != '/' && i != path.size() - 1) {
-            continue;
-        }
-        if (current.empty()) {
-            continue;
-        }
-        if (current.back() == '/' && current.size() > 1) {
-            current.pop_back();
-        }
-        if (current.empty()) {
-            current = "/";
-        }
-
-        if (stat(current.c_str(), &st) == 0) {
-            if (!S_ISDIR(st.st_mode)) {
-                return false;
-            }
-            continue;
-        }
-
-        if (mkdir(current.c_str(), 0755) != 0 && errno != EEXIST) {
-            __android_log_print(ANDROID_LOG_ERROR, kLogTag, "mkdir failed: %s (%d)", current.c_str(), errno);
+    if (stat(normalized_path.c_str(), &st) == 0) {
+        if (!S_ISDIR(st.st_mode)) {
+            __android_log_print(
+                ANDROID_LOG_ERROR,
+                kLogTag,
+                "EnsureDirectoryRecursive: path exists but not directory: %s",
+                normalized_path.c_str());
             return false;
         }
+        return true;
     }
 
-    if (stat(path.c_str(), &st) == 0) {
+    const bool is_absolute = !normalized_path.empty() && normalized_path.front() == '/';
+    std::string current = is_absolute ? "/" : "";
+    size_t start = is_absolute ? 1 : 0;
+    while (start <= normalized_path.size()) {
+        const size_t slash = normalized_path.find('/', start);
+        const size_t end = (slash == std::string::npos) ? normalized_path.size() : slash;
+        const std::string token = normalized_path.substr(start, end - start);
+
+        if (!token.empty() && token != ".") {
+            if (current.empty()) {
+                current = token;
+            } else if (current == "/") {
+                current += token;
+            } else {
+                current += "/" + token;
+            }
+
+            if (stat(current.c_str(), &st) == 0) {
+                if (!S_ISDIR(st.st_mode)) {
+                    __android_log_print(
+                        ANDROID_LOG_ERROR,
+                        kLogTag,
+                        "EnsureDirectoryRecursive: path exists but not directory: %s",
+                        current.c_str());
+                    return false;
+                }
+            } else if (mkdir(current.c_str(), 0755) != 0 && errno != EEXIST) {
+                LogErrno("EnsureDirectoryRecursive: mkdir failed", current);
+                return false;
+            }
+        }
+
+        if (slash == std::string::npos) {
+            break;
+        }
+        start = slash + 1;
+    }
+
+    if (stat(normalized_path.c_str(), &st) == 0) {
         return S_ISDIR(st.st_mode);
     }
-    return mkdir(path.c_str(), 0755) == 0 || errno == EEXIST;
+    if (mkdir(normalized_path.c_str(), 0755) == 0 || errno == EEXIST) {
+        return true;
+    }
+    LogErrno("EnsureDirectoryRecursive: final mkdir failed", normalized_path);
+    return false;
 }
 
 bool NormalizeArchivePath(const char* archive_path, std::string* out_relative_path) {
     if (archive_path == nullptr || out_relative_path == nullptr) {
+        __android_log_print(ANDROID_LOG_ERROR, kLogTag, "NormalizeArchivePath: null input");
         return false;
     }
 
@@ -115,6 +165,7 @@ bool NormalizeArchivePath(const char* archive_path, std::string* out_relative_pa
         const std::string token = input.substr(start, end - start);
         if (!token.empty() && token != ".") {
             if (token == "..") {
+                __android_log_print(ANDROID_LOG_ERROR, kLogTag, "NormalizeArchivePath: '..' is not allowed: %s", input.c_str());
                 return false;
             }
             if (!normalized.empty()) {
@@ -173,13 +224,18 @@ bool WriteExtractionMarker(const std::string& extract_dst_path) {
     const std::string marker_path = MarkerPath(extract_dst_path);
     const int fd = open(marker_path.c_str(), O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0644);
     if (fd < 0) {
+        LogErrno("WriteExtractionMarker: open failed", marker_path);
         return false;
     }
 
     constexpr const char kMarkerContents[] = "ready\n";
     const ssize_t written = write(fd, kMarkerContents, sizeof(kMarkerContents) - 1);
     close(fd);
-    return written == static_cast<ssize_t>(sizeof(kMarkerContents) - 1);
+    if (written != static_cast<ssize_t>(sizeof(kMarkerContents) - 1)) {
+        LogErrno("WriteExtractionMarker: write failed", marker_path);
+        return false;
+    }
+    return true;
 }
 
 bool EndsWith(const std::string& value, const std::string& suffix) {
@@ -196,6 +252,7 @@ bool WriteAll(int fd, const void* data, size_t size) {
             if (errno == EINTR) {
                 continue;
             }
+            LogErrno("WriteAll: write failed");
             return false;
         }
         total += static_cast<size_t>(written);
@@ -206,23 +263,31 @@ bool WriteAll(int fd, const void* data, size_t size) {
 bool DecompressZstdFileToTar(const std::string& input_path, const std::string& output_path) {
     int in_fd = open(input_path.c_str(), O_RDONLY | O_CLOEXEC);
     if (in_fd < 0) {
+        LogErrno("DecompressZstdFileToTar: open input failed", input_path);
         return false;
     }
 
     int out_fd = open(output_path.c_str(), O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0644);
     if (out_fd < 0) {
+        LogErrno("DecompressZstdFileToTar: open output failed", output_path);
         close(in_fd);
         return false;
     }
 
     ZSTD_DStream* stream = ZSTD_createDStream();
     if (stream == nullptr) {
+        __android_log_print(ANDROID_LOG_ERROR, kLogTag, "DecompressZstdFileToTar: ZSTD_createDStream failed");
         close(in_fd);
         close(out_fd);
         return false;
     }
     size_t zstd_result = ZSTD_initDStream(stream);
     if (ZSTD_isError(zstd_result)) {
+        __android_log_print(
+            ANDROID_LOG_ERROR,
+            kLogTag,
+            "DecompressZstdFileToTar: ZSTD_initDStream failed: %s",
+            ZSTD_getErrorName(zstd_result));
         ZSTD_freeDStream(stream);
         close(in_fd);
         close(out_fd);
@@ -240,6 +305,7 @@ bool DecompressZstdFileToTar(const std::string& input_path, const std::string& o
             if (errno == EINTR) {
                 continue;
             }
+            LogErrno("DecompressZstdFileToTar: read failed", input_path);
             ok = false;
             break;
         }
@@ -253,6 +319,11 @@ bool DecompressZstdFileToTar(const std::string& input_path, const std::string& o
 
             zstd_result = ZSTD_decompressStream(stream, &output, &input);
             if (ZSTD_isError(zstd_result)) {
+                __android_log_print(
+                    ANDROID_LOG_ERROR,
+                    kLogTag,
+                    "DecompressZstdFileToTar: ZSTD_decompressStream failed: %s",
+                    ZSTD_getErrorName(zstd_result));
                 ok = false;
                 break;
             }
@@ -266,6 +337,7 @@ bool DecompressZstdFileToTar(const std::string& input_path, const std::string& o
     }
 
     if (ok && !reached_frame_end) {
+        __android_log_print(ANDROID_LOG_ERROR, kLogTag, "DecompressZstdFileToTar: truncated zstd stream: %s", input_path.c_str());
         ok = false;
     }
 
@@ -282,6 +354,7 @@ bool DecompressZstdFileToTar(const std::string& input_path, const std::string& o
 
 bool IsRootfsExtracted(const std::string& extract_dst_path) {
     if (extract_dst_path.empty()) {
+        __android_log_print(ANDROID_LOG_ERROR, kLogTag, "IsRootfsExtracted: empty extract path");
         return false;
     }
 
@@ -295,20 +368,36 @@ bool IsRootfsExtracted(const std::string& extract_dst_path) {
 
 bool ExtractRootfs(const std::string& archive_path, const std::string& extract_dst_path) {
     if (archive_path.empty() || extract_dst_path.empty()) {
+        __android_log_print(
+            ANDROID_LOG_ERROR,
+            kLogTag,
+            "ExtractRootfs: empty path(s), archive='%s', dst='%s'",
+            archive_path.c_str(),
+            extract_dst_path.c_str());
         return false;
     }
 
     if (!EnsureDirectoryRecursive(extract_dst_path)) {
+        __android_log_print(ANDROID_LOG_ERROR, kLogTag, "ExtractRootfs: failed to ensure destination directory: %s", extract_dst_path.c_str());
         return false;
     }
 
-    unlink(MarkerPath(extract_dst_path).c_str());
+    const std::string marker_path = MarkerPath(extract_dst_path);
+    if (unlink(marker_path.c_str()) != 0 && errno != ENOENT) {
+        LogErrno("ExtractRootfs: failed to remove marker", marker_path);
+    }
 
     std::string prepared_archive_path = archive_path;
     const std::string temp_tar_path = JoinPath(extract_dst_path, ".andlify_rootfs_tmp.tar");
     if (EndsWith(archive_path, ".zst") || EndsWith(archive_path, ".tzst")) {
         unlink(temp_tar_path.c_str());
         if (!DecompressZstdFileToTar(archive_path, temp_tar_path)) {
+            __android_log_print(
+                ANDROID_LOG_ERROR,
+                kLogTag,
+                "ExtractRootfs: zstd decompress failed, archive=%s, tempTar=%s",
+                archive_path.c_str(),
+                temp_tar_path.c_str());
             return false;
         }
         prepared_archive_path = temp_tar_path;
@@ -317,6 +406,7 @@ bool ExtractRootfs(const std::string& archive_path, const std::string& extract_d
     struct archive* archive_reader = archive_read_new();
     struct archive* archive_writer = archive_write_disk_new();
     if (archive_reader == nullptr || archive_writer == nullptr) {
+        __android_log_print(ANDROID_LOG_ERROR, kLogTag, "ExtractRootfs: failed to allocate libarchive reader/writer");
         if (archive_reader != nullptr) {
             archive_read_free(archive_reader);
         }
@@ -412,7 +502,27 @@ bool ExtractRootfs(const std::string& archive_path, const std::string& extract_d
     }
 
     if (!ok) {
+        __android_log_print(
+            ANDROID_LOG_ERROR,
+            kLogTag,
+            "ExtractRootfs: extraction loop failed, archive=%s dst=%s",
+            prepared_archive_path.c_str(),
+            extract_dst_path.c_str());
         return false;
     }
-    return WriteExtractionMarker(extract_dst_path);
+    if (!WriteExtractionMarker(extract_dst_path)) {
+        __android_log_print(
+            ANDROID_LOG_ERROR,
+            kLogTag,
+            "ExtractRootfs: failed to write marker, dst=%s",
+            extract_dst_path.c_str());
+        return false;
+    }
+    __android_log_print(
+        ANDROID_LOG_INFO,
+        kLogTag,
+        "ExtractRootfs: success, archive=%s dst=%s",
+        archive_path.c_str(),
+        extract_dst_path.c_str());
+    return true;
 }

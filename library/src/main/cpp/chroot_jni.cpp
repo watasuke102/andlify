@@ -1,11 +1,14 @@
 #include "ptrace_engine.h"
 #include "rootfs_extractor.h"
 
+#include <android/log.h>
 #include <jni.h>
 
 #include <string>
 
 namespace {
+
+constexpr const char* kLogTag = "andlify-rootfs";
 
 std::string JStringToUtf8(JNIEnv* env, jstring value) {
     if (value == nullptr) {
@@ -30,7 +33,16 @@ jboolean JniIsRootfsExtracted(JNIEnv* env, jobject /*thiz*/, jstring extract_dst
 jboolean JniExtractRootfs(JNIEnv* env, jobject /*thiz*/, jstring archive_path, jstring extract_dst_path) {
     const std::string archive = JStringToUtf8(env, archive_path);
     const std::string destination = JStringToUtf8(env, extract_dst_path);
-    return ExtractRootfs(archive, destination) ? JNI_TRUE : JNI_FALSE;
+    const bool ok = ExtractRootfs(archive, destination);
+    if (!ok) {
+        __android_log_print(
+            ANDROID_LOG_ERROR,
+            kLogTag,
+            "JNI extract_rootfs failed, archive=%s dst=%s",
+            archive.c_str(),
+            destination.c_str());
+    }
+    return ok ? JNI_TRUE : JNI_FALSE;
 }
 
 jint JniStartChroot(

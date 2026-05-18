@@ -16,3 +16,4 @@ dependencyResolutionManagement {
 
 rootProject.name = "andlify"
 include(":library")
+include(":example")
