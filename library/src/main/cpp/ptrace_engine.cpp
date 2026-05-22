@@ -7,10 +7,12 @@
 #include <asm/ptrace.h>
 #include <elf.h>
 #include <errno.h>
+#include <fcntl.h>
 #include <linux/ptrace.h>
 #include <signal.h>
 #include <stdint.h>
 #include <stdlib.h>
+#include <string.h>
 #include <sys/ptrace.h>
 #include <sys/prctl.h>
 #include <sys/types.h>
@@ -21,12 +23,18 @@
 #include <string>
 #include <unordered_map>
 #include <unordered_set>
+#include <vector>
 
 namespace {
 
 constexpr const char* kLogTag = "andlify-ptrace";
 constexpr uint64_t kSysOpenat = 56;
 constexpr uint64_t kSysFaccessat = 48;
+constexpr uint64_t kSysNewfstatat = 79;
+constexpr uint64_t kSysReadlinkat = 78;
+constexpr uint64_t kSysFaccessat2 = 439;
+constexpr uint64_t kSysOpenat2 = 437;
+constexpr uint64_t kSysStatx = 291;
 constexpr uint64_t kSysExecve = 221;
 constexpr size_t kPathReadLimit = 4096;
 constexpr uint64_t kStackScratchOffset = 0x800;
@@ -34,6 +42,11 @@ constexpr uint64_t kStackScratchOffset = 0x800;
 struct TraceeState {
     bool expect_entry = true;
     bool options_applied = false;
+};
+
+struct ExecPlan {
+    std::string executable_path;
+    std::vector<std::string> args;
 };
 
 bool GetRegs(pid_t pid, user_pt_regs* regs) {
@@ -52,11 +65,116 @@ bool ApplyTraceOptions(pid_t pid) {
     return ptrace(PTRACE_SETOPTIONS, pid, nullptr, options) == 0;
 }
 
+bool ReadFullyAt(int fd, off_t offset, void* out, size_t len) {
+    auto* bytes = static_cast<uint8_t*>(out);
+    size_t copied = 0;
+    while (copied < len) {
+        const ssize_t n = pread(fd, bytes + copied, len - copied, offset + static_cast<off_t>(copied));
+        if (n < 0) {
+            if (errno == EINTR) {
+                continue;
+            }
+            return false;
+        }
+        if (n == 0) {
+            return false;
+        }
+        copied += static_cast<size_t>(n);
+    }
+    return true;
+}
+
+bool ReadElfInterpreter(const std::string& executable_path, std::string* interpreter_path) {
+    if (interpreter_path == nullptr) {
+        return false;
+    }
+    interpreter_path->clear();
+
+    const int fd = open(executable_path.c_str(), O_RDONLY | O_CLOEXEC);
+    if (fd < 0) {
+        __android_log_print(
+            ANDROID_LOG_WARN,
+            kLogTag,
+            "Failed to open command for ELF inspection: %s (%s)",
+            executable_path.c_str(),
+            strerror(errno));
+        return false;
+    }
+
+    Elf64_Ehdr header {};
+    if (!ReadFullyAt(fd, 0, &header, sizeof(header))) {
+        close(fd);
+        return false;
+    }
+    if (memcmp(header.e_ident, ELFMAG, SELFMAG) != 0 || header.e_ident[EI_CLASS] != ELFCLASS64 ||
+        header.e_phoff == 0 || header.e_phentsize != sizeof(Elf64_Phdr)) {
+        close(fd);
+        return false;
+    }
+
+    for (uint16_t i = 0; i < header.e_phnum; ++i) {
+        Elf64_Phdr phdr {};
+        const off_t phdr_offset = static_cast<off_t>(header.e_phoff + static_cast<Elf64_Off>(i) * header.e_phentsize);
+        if (!ReadFullyAt(fd, phdr_offset, &phdr, sizeof(phdr))) {
+            close(fd);
+            return false;
+        }
+        if (phdr.p_type != PT_INTERP || phdr.p_filesz == 0) {
+            continue;
+        }
+
+        std::vector<char> buffer(static_cast<size_t>(phdr.p_filesz), '\0');
+        if (!ReadFullyAt(fd, static_cast<off_t>(phdr.p_offset), buffer.data(), buffer.size())) {
+            close(fd);
+            return false;
+        }
+        close(fd);
+        interpreter_path->assign(buffer.data(), strnlen(buffer.data(), buffer.size()));
+        return !interpreter_path->empty();
+    }
+
+    close(fd);
+    return false;
+}
+
+ExecPlan BuildExecPlan(const std::string& extract_dst_path, const std::string& command_path_in_rootfs) {
+    const std::string real_exec_path = BuildRealPathInRootfs(extract_dst_path, command_path_in_rootfs);
+    ExecPlan plan {real_exec_path, {command_path_in_rootfs.empty() ? std::string("/bin/sh") : command_path_in_rootfs}};
+    if (real_exec_path.empty()) {
+        return plan;
+    }
+
+    std::string interpreter_path;
+    if (!ReadElfInterpreter(real_exec_path, &interpreter_path)) {
+        return plan;
+    }
+
+    const std::string real_interpreter_path = BuildRealPathInRootfs(extract_dst_path, interpreter_path);
+    if (real_interpreter_path.empty()) {
+        return plan;
+    }
+
+    __android_log_print(
+        ANDROID_LOG_INFO,
+        kLogTag,
+        "Launching dynamic ELF through interpreter: command=%s interpreter=%s",
+        real_exec_path.c_str(),
+        real_interpreter_path.c_str());
+    plan.executable_path = real_interpreter_path;
+    plan.args = {interpreter_path, real_exec_path};
+    return plan;
+}
+
 int PathArgumentIndexForSyscall(uint64_t syscall_number) {
     switch (syscall_number) {
         case kSysOpenat:
+        case kSysOpenat2:
             return 1;
         case kSysFaccessat:
+        case kSysFaccessat2:
+        case kSysNewfstatat:
+        case kSysReadlinkat:
+        case kSysStatx:
             return 1;
         case kSysExecve:
             return 0;
@@ -88,6 +206,15 @@ void RewritePathArgumentIfNeeded(pid_t pid, const std::string& normalized_rootfs
     if (rewritten_path == original_path) {
         return;
     }
+
+    __android_log_print(
+        ANDROID_LOG_VERBOSE,
+        kLogTag,
+        "rewrite pid=%d syscall=%llu %s -> %s",
+        pid,
+        static_cast<unsigned long long>(regs->regs[8]),
+        original_path.c_str(),
+        rewritten_path.c_str());
 
     const uint64_t scratch_address = regs->sp > kStackScratchOffset ? regs->sp - kStackScratchOffset : 0;
     if (scratch_address != 0 &&
@@ -125,8 +252,8 @@ int ChildTraceeMain(
         return 127;
     }
 
-    const std::string real_exec_path = BuildRealPathInRootfs(extract_dst_path, command_path_in_rootfs);
-    if (real_exec_path.empty()) {
+    const ExecPlan exec_plan = BuildExecPlan(extract_dst_path, command_path_in_rootfs);
+    if (exec_plan.executable_path.empty() || exec_plan.args.empty()) {
         return 127;
     }
 
@@ -135,12 +262,13 @@ int ChildTraceeMain(
     }
     raise(SIGSTOP);
 
-    std::string argv0 = command_path_in_rootfs;
-    if (argv0.empty()) {
-        argv0 = "/bin/sh";
+    std::vector<char*> argv;
+    argv.reserve(exec_plan.args.size() + 1);
+    for (const std::string& arg : exec_plan.args) {
+        argv.push_back(const_cast<char*>(arg.c_str()));
     }
+    argv.push_back(nullptr);
 
-    char* const argv[] = {const_cast<char*>(argv0.c_str()), nullptr};
     char* const envp[] = {
         const_cast<char*>("PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"),
         const_cast<char*>("HOME=/root"),
@@ -148,7 +276,14 @@ int ChildTraceeMain(
         const_cast<char*>("TERM=xterm-256color"),
         nullptr,
     };
-    execve(real_exec_path.c_str(), argv, envp);
+    execve(exec_plan.executable_path.c_str(), argv.data(), envp);
+    __android_log_print(
+        ANDROID_LOG_ERROR,
+        kLogTag,
+        "execve failed: executable=%s errno=%d (%s)",
+        exec_plan.executable_path.c_str(),
+        errno,
+        strerror(errno));
     return 126;
 }
 
@@ -156,6 +291,44 @@ void ResumeSyscall(pid_t pid, int signal_number) {
     if (ptrace(PTRACE_SYSCALL, pid, nullptr, signal_number) != 0) {
         __android_log_print(ANDROID_LOG_WARN, kLogTag, "PTRACE_SYSCALL failed for pid=%d (%d)", pid, errno);
     }
+}
+
+bool SuppressBlockedSyscall(pid_t pid, TraceeState* state) {
+    user_pt_regs regs {};
+    if (!GetRegs(pid, &regs)) {
+        __android_log_print(ANDROID_LOG_WARN, kLogTag, "Failed to read regs for SIGSYS pid=%d", pid);
+        return false;
+    }
+
+    siginfo_t siginfo {};
+    const bool has_siginfo = ptrace(PTRACE_GETSIGINFO, pid, nullptr, &siginfo) == 0;
+    if (has_siginfo) {
+        __android_log_print(
+            ANDROID_LOG_WARN,
+            kLogTag,
+            "pid=%d blocked syscall=%d arch=0x%x code=%d; returning ENOSYS",
+            pid,
+            siginfo.si_syscall,
+            siginfo.si_arch,
+            siginfo.si_code);
+    } else {
+        __android_log_print(
+            ANDROID_LOG_WARN,
+            kLogTag,
+            "pid=%d blocked syscall=%llu; returning ENOSYS",
+            pid,
+            static_cast<unsigned long long>(regs.regs[8]));
+    }
+
+    regs.regs[0] = static_cast<uint64_t>(-ENOSYS);
+    if (!SetRegs(pid, regs)) {
+        __android_log_print(ANDROID_LOG_WARN, kLogTag, "Failed to set ENOSYS result for pid=%d", pid);
+        return false;
+    }
+    if (state != nullptr) {
+        state->expect_entry = true;
+    }
+    return true;
 }
 
 int TracerMain(
@@ -202,7 +375,24 @@ int TracerMain(
             break;
         }
 
-        if (WIFEXITED(wait_status) || WIFSIGNALED(wait_status)) {
+        if (WIFEXITED(wait_status)) {
+            __android_log_print(
+                ANDROID_LOG_INFO,
+                kLogTag,
+                "pid=%d exited status=%d",
+                pid,
+                WEXITSTATUS(wait_status));
+            tracked_pids.erase(pid);
+            states.erase(pid);
+            continue;
+        }
+        if (WIFSIGNALED(wait_status)) {
+            __android_log_print(
+                ANDROID_LOG_WARN,
+                kLogTag,
+                "pid=%d killed signal=%d",
+                pid,
+                WTERMSIG(wait_status));
             tracked_pids.erase(pid);
             states.erase(pid);
             continue;
@@ -231,6 +421,12 @@ int TracerMain(
         }
 
         if (signal_number == SIGTRAP && event != 0U) {
+            __android_log_print(
+                ANDROID_LOG_VERBOSE,
+                kLogTag,
+                "pid=%d ptrace event=%u",
+                pid,
+                event);
             if (event == PTRACE_EVENT_FORK || event == PTRACE_EVENT_VFORK || event == PTRACE_EVENT_CLONE) {
                 unsigned long new_pid = 0;
                 if (ptrace(PTRACE_GETEVENTMSG, pid, nullptr, &new_pid) == 0 && new_pid > 0) {
@@ -247,6 +443,21 @@ int TracerMain(
             continue;
         }
 
+        if (signal_number == SIGSYS) {
+            if (SuppressBlockedSyscall(pid, &state)) {
+                ResumeSyscall(pid, 0);
+            } else {
+                ResumeSyscall(pid, signal_number);
+            }
+            continue;
+        }
+
+        __android_log_print(
+            ANDROID_LOG_VERBOSE,
+            kLogTag,
+            "pid=%d signal stop=%d",
+            pid,
+            signal_number);
         ResumeSyscall(pid, signal_number);
     }
 
