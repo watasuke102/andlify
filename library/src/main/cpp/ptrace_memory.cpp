@@ -88,6 +88,31 @@ bool ReadTraceeCString(pid_t pid, uint64_t remote_address, size_t max_len, std::
     return ReadTraceeCStringPtrace(pid, remote_address, max_len, out);
 }
 
+bool ReadTraceeMemory(pid_t pid, uint64_t remote_address, void* out, size_t len) {
+    if (remote_address == 0 || out == nullptr || len == 0) {
+        return false;
+    }
+
+    if (ReadTraceeMemoryProcessVm(pid, remote_address, out, len)) {
+        return true;
+    }
+
+    auto* bytes = static_cast<uint8_t*>(out);
+    size_t copied = 0;
+    while (copied < len) {
+        errno = 0;
+        const long word = ptrace(PTRACE_PEEKDATA, pid, remote_address + copied, nullptr);
+        if (errno != 0) {
+            return false;
+        }
+
+        const size_t chunk = std::min(sizeof(long), len - copied);
+        memcpy(bytes + copied, &word, chunk);
+        copied += chunk;
+    }
+    return true;
+}
+
 bool WriteTraceeMemory(pid_t pid, uint64_t remote_address, const void* data, size_t len) {
     if (remote_address == 0 || data == nullptr || len == 0) {
         return false;

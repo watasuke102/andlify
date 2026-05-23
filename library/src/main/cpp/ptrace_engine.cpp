@@ -39,6 +39,8 @@ constexpr uint64_t kSysStatx = 291;
 constexpr uint64_t kSysExecve = 221;
 constexpr size_t kPathReadLimit = 4096;
 constexpr uint64_t kStackScratchOffset = 0x800;
+constexpr uint64_t kExecScratchSize = 0x2000;
+constexpr size_t kMaxExecArgCount = 64;
 
 struct TraceeState {
     bool expect_entry = true;
@@ -48,6 +50,12 @@ struct TraceeState {
 struct ExecPlan {
     std::string executable_path;
     std::vector<std::string> args;
+};
+
+enum class ExecRewriteResult {
+    kNotApplicable,
+    kApplied,
+    kFailed,
 };
 
 bool GetRegs(pid_t pid, user_pt_regs* regs) {
@@ -83,6 +91,10 @@ bool ReadFullyAt(int fd, off_t offset, void* out, size_t len) {
         copied += static_cast<size_t>(n);
     }
     return true;
+}
+
+uint64_t AlignUp(uint64_t value, uint64_t alignment) {
+    return (value + alignment - 1U) & ~(alignment - 1U);
 }
 
 bool ReadElfInterpreter(const std::string& executable_path, std::string* interpreter_path) {
@@ -164,6 +176,131 @@ ExecPlan BuildExecPlan(const std::string& extract_dst_path, const std::string& c
     plan.executable_path = real_interpreter_path;
     plan.args = {interpreter_path, real_exec_path};
     return plan;
+}
+
+bool ReadTraceeArgv(pid_t pid, uint64_t argv_address, std::vector<uint64_t>* argv_out) {
+    if (argv_out == nullptr || argv_address == 0) {
+        return false;
+    }
+
+    argv_out->clear();
+    for (size_t i = 0; i < kMaxExecArgCount; ++i) {
+        uint64_t arg_ptr = 0;
+        if (!ReadTraceeMemory(pid, argv_address + (i * sizeof(uint64_t)), &arg_ptr, sizeof(arg_ptr))) {
+            return false;
+        }
+        if (arg_ptr == 0) {
+            return !argv_out->empty();
+        }
+        argv_out->push_back(arg_ptr);
+    }
+    return false;
+}
+
+ExecRewriteResult RewriteExecveForDynamicElfIfNeeded(
+    pid_t pid,
+    const std::string& normalized_rootfs,
+    user_pt_regs* regs) {
+    if (regs == nullptr || regs->regs[8] != kSysExecve) {
+        return ExecRewriteResult::kNotApplicable;
+    }
+
+    const uint64_t source_path_address = regs->regs[0];
+    const uint64_t argv_address = regs->regs[1];
+    if (source_path_address == 0 || argv_address == 0) {
+        return ExecRewriteResult::kNotApplicable;
+    }
+
+    std::string original_path;
+    if (!ReadTraceeCString(pid, source_path_address, kPathReadLimit, &original_path) ||
+        !IsAbsoluteUnixPath(original_path)) {
+        return ExecRewriteResult::kNotApplicable;
+    }
+
+    const std::string rewritten_path = RewritePathToRootfs(normalized_rootfs, original_path);
+    std::string interpreter_path;
+    if (!ReadElfInterpreter(rewritten_path, &interpreter_path)) {
+        return ExecRewriteResult::kNotApplicable;
+    }
+
+    const std::string rewritten_interpreter_path = BuildRealPathInRootfs(normalized_rootfs, interpreter_path);
+    if (rewritten_interpreter_path.empty()) {
+        __android_log_print(
+            ANDROID_LOG_WARN,
+            kLogTag,
+            "Dynamic execve interpreter resolved to empty path for %s",
+            rewritten_path.c_str());
+        return ExecRewriteResult::kFailed;
+    }
+
+    std::vector<uint64_t> original_argv;
+    if (!ReadTraceeArgv(pid, argv_address, &original_argv)) {
+        __android_log_print(
+            ANDROID_LOG_WARN,
+            kLogTag,
+            "Failed to read argv for execve pid=%d path=%s",
+            pid,
+            rewritten_path.c_str());
+        return ExecRewriteResult::kFailed;
+    }
+
+    if (regs->sp <= kExecScratchSize + kStackScratchOffset) {
+        return ExecRewriteResult::kFailed;
+    }
+
+    const uint64_t scratch_base = regs->sp - kExecScratchSize;
+    uint64_t cursor = scratch_base;
+
+    const uint64_t interpreter_string_address = cursor;
+    if (!WriteTraceeMemory(
+            pid,
+            cursor,
+            rewritten_interpreter_path.c_str(),
+            rewritten_interpreter_path.size() + 1)) {
+        return ExecRewriteResult::kFailed;
+    }
+    cursor += rewritten_interpreter_path.size() + 1;
+    cursor = AlignUp(cursor, sizeof(uint64_t));
+
+    const uint64_t binary_string_address = cursor;
+    if (!WriteTraceeMemory(pid, cursor, rewritten_path.c_str(), rewritten_path.size() + 1)) {
+        return ExecRewriteResult::kFailed;
+    }
+    cursor += rewritten_path.size() + 1;
+    cursor = AlignUp(cursor, sizeof(uint64_t));
+
+    std::vector<uint64_t> rewritten_argv;
+    rewritten_argv.reserve(original_argv.size() + 2);
+    rewritten_argv.push_back(interpreter_string_address);
+    rewritten_argv.push_back(binary_string_address);
+    for (size_t i = 1; i < original_argv.size(); ++i) {
+        rewritten_argv.push_back(original_argv[i]);
+    }
+    rewritten_argv.push_back(0);
+
+    const uint64_t rewritten_argv_address = cursor;
+    if (!WriteTraceeMemory(
+            pid,
+            rewritten_argv_address,
+            rewritten_argv.data(),
+            rewritten_argv.size() * sizeof(uint64_t))) {
+        return ExecRewriteResult::kFailed;
+    }
+
+    regs->regs[0] = interpreter_string_address;
+    regs->regs[1] = rewritten_argv_address;
+    if (!SetRegs(pid, *regs)) {
+        return ExecRewriteResult::kFailed;
+    }
+
+    __android_log_print(
+        ANDROID_LOG_INFO,
+        kLogTag,
+        "Rewrote execve to interpreter pid=%d command=%s interpreter=%s",
+        pid,
+        rewritten_path.c_str(),
+        rewritten_interpreter_path.c_str());
+    return ExecRewriteResult::kApplied;
 }
 
 int PathArgumentIndexForSyscall(uint64_t syscall_number) {
@@ -414,7 +551,11 @@ int TracerMain(
             if (state.expect_entry) {
                 user_pt_regs regs {};
                 if (GetRegs(pid, &regs)) {
-                    RewritePathArgumentIfNeeded(pid, normalized_rootfs, &regs);
+                    const ExecRewriteResult exec_rewrite_result =
+                        RewriteExecveForDynamicElfIfNeeded(pid, normalized_rootfs, &regs);
+                    if (exec_rewrite_result == ExecRewriteResult::kNotApplicable) {
+                        RewritePathArgumentIfNeeded(pid, normalized_rootfs, &regs);
+                    }
                 }
             }
             state.expect_entry = !state.expect_entry;

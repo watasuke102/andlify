@@ -7,4 +7,5 @@
 #include <string>
 
 bool ReadTraceeCString(pid_t pid, uint64_t remote_address, size_t max_len, std::string* out);
+bool ReadTraceeMemory(pid_t pid, uint64_t remote_address, void* out, size_t len);
 bool WriteTraceeMemory(pid_t pid, uint64_t remote_address, const void* data, size_t len);
