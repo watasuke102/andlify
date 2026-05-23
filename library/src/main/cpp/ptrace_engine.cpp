@@ -29,6 +29,7 @@ namespace {
 
 constexpr const char* kLogTag = "andlify-ptrace";
 constexpr uint64_t kSysOpenat = 56;
+constexpr uint64_t kSysChdir = 49;
 constexpr uint64_t kSysFaccessat = 48;
 constexpr uint64_t kSysNewfstatat = 79;
 constexpr uint64_t kSysReadlinkat = 78;
@@ -176,6 +177,7 @@ int PathArgumentIndexForSyscall(uint64_t syscall_number) {
         case kSysReadlinkat:
         case kSysStatx:
             return 1;
+        case kSysChdir:
         case kSysExecve:
             return 0;
         default:
