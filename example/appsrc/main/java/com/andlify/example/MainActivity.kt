@@ -50,7 +50,7 @@ class MainActivity : AppCompatActivity() {
         chatRecycler.adapter = adapter
 
         rootfsPathInput.setText(File(filesDir, "rootfs").absolutePath)
-        commandPathInput.setText("/bin/sh")
+        commandPathInput.setText("/usr/bin/bash")
 
         extractButton.setOnClickListener { runExtraction() }
         startButton.setOnClickListener { runSessionStart() }
