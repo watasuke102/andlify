@@ -37,15 +37,6 @@ android {
     androidResources {
         noCompress += listOf("zst")
     }
-
-    sourceSets {
-        getByName("main") {
-            manifest.srcFile("appsrc/main/AndroidManifest.xml")
-            java.srcDirs("appsrc/main/java")
-            res.srcDirs("appsrc/main/res")
-            assets.srcDirs("src/main/assets")
-        }
-    }
 }
 
 kotlin {
