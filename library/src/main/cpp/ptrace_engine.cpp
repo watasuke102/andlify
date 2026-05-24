@@ -37,14 +37,40 @@ constexpr uint64_t kSysFaccessat2 = 439;
 constexpr uint64_t kSysOpenat2 = 437;
 constexpr uint64_t kSysStatx = 291;
 constexpr uint64_t kSysExecve = 221;
+constexpr uint64_t kSysCapset = 91;
+constexpr uint64_t kSysSocket = 198;
+constexpr uint64_t kSysSetgid = 144;
+constexpr uint64_t kSysSetuid = 146;
+constexpr uint64_t kSysSetresuid = 147;
+constexpr uint64_t kSysGetresuid = 148;
+constexpr uint64_t kSysSetresgid = 149;
+constexpr uint64_t kSysGetresgid = 150;
+constexpr uint64_t kSysGetgroups = 158;
+constexpr uint64_t kSysSetgroups = 159;
+constexpr uint64_t kSysGetuid = 174;
+constexpr uint64_t kSysGeteuid = 175;
+constexpr uint64_t kSysGetgid = 176;
+constexpr uint64_t kSysGetegid = 177;
 constexpr size_t kPathReadLimit = 4096;
 constexpr uint64_t kStackScratchOffset = 0x800;
 constexpr uint64_t kExecScratchSize = 0x2000;
 constexpr size_t kMaxExecArgCount = 64;
+constexpr uint64_t kSkippedSyscall = static_cast<uint64_t>(-1);
+constexpr uint64_t kRootUid = 0;
+constexpr uint64_t kRootGid = 0;
+constexpr uint64_t kAfInet = 2;
+constexpr uint64_t kAfInet6 = 10;
+constexpr uint64_t kSockDgram = 2;
+constexpr uint64_t kSockRaw = 3;
+constexpr uint64_t kSockTypeMask = 0xf;
+constexpr uint64_t kIpProtoIcmp = 1;
+constexpr uint64_t kIpProtoIcmpv6 = 58;
 
 struct TraceeState {
     bool expect_entry = true;
     bool options_applied = false;
+    bool has_emulated_return = false;
+    uint64_t emulated_return = 0;
 };
 
 struct ExecPlan {
@@ -303,6 +329,133 @@ ExecRewriteResult RewriteExecveForDynamicElfIfNeeded(
     return ExecRewriteResult::kApplied;
 }
 
+void SetEmulatedSyscallReturn(pid_t pid, TraceeState* state, user_pt_regs* regs, int64_t return_value) {
+    if (state == nullptr || regs == nullptr) {
+        return;
+    }
+
+    regs->regs[8] = kSkippedSyscall;
+    if (!SetRegs(pid, *regs)) {
+        __android_log_print(ANDROID_LOG_WARN, kLogTag, "Failed to skip syscall for pid=%d", pid);
+        return;
+    }
+
+    state->has_emulated_return = true;
+    state->emulated_return = static_cast<uint64_t>(return_value);
+}
+
+bool MaybeEmulateUidGidSyscall(pid_t pid, TraceeState* state, user_pt_regs* regs) {
+    if (regs == nullptr) {
+        return false;
+    }
+
+    switch (regs->regs[8]) {
+        case kSysGetuid:
+        case kSysGeteuid:
+            SetEmulatedSyscallReturn(pid, state, regs, kRootUid);
+            return true;
+        case kSysGetgid:
+        case kSysGetegid:
+            SetEmulatedSyscallReturn(pid, state, regs, kRootGid);
+            return true;
+        case kSysSetuid:
+        case kSysSetgid:
+        case kSysSetresuid:
+        case kSysSetresgid:
+        case kSysSetgroups:
+        case kSysCapset:
+            SetEmulatedSyscallReturn(pid, state, regs, 0);
+            return true;
+        case kSysGetresuid: {
+            const uint32_t root = 0;
+            WriteTraceeMemory(pid, regs->regs[0], &root, sizeof(root));
+            WriteTraceeMemory(pid, regs->regs[1], &root, sizeof(root));
+            WriteTraceeMemory(pid, regs->regs[2], &root, sizeof(root));
+            SetEmulatedSyscallReturn(pid, state, regs, 0);
+            return true;
+        }
+        case kSysGetresgid: {
+            const uint32_t root = 0;
+            WriteTraceeMemory(pid, regs->regs[0], &root, sizeof(root));
+            WriteTraceeMemory(pid, regs->regs[1], &root, sizeof(root));
+            WriteTraceeMemory(pid, regs->regs[2], &root, sizeof(root));
+            SetEmulatedSyscallReturn(pid, state, regs, 0);
+            return true;
+        }
+        case kSysGetgroups: {
+            const uint64_t size = regs->regs[0];
+            const uint64_t list = regs->regs[1];
+            if (size == 0) {
+                SetEmulatedSyscallReturn(pid, state, regs, 1);
+                return true;
+            }
+            if (list == 0) {
+                SetEmulatedSyscallReturn(pid, state, regs, -EFAULT);
+                return true;
+            }
+            const uint32_t root = 0;
+            WriteTraceeMemory(pid, list, &root, sizeof(root));
+            SetEmulatedSyscallReturn(pid, state, regs, 1);
+            return true;
+        }
+        default:
+            return false;
+    }
+}
+
+bool MaybeRewritePingSocket(pid_t pid, user_pt_regs* regs) {
+    if (regs == nullptr || regs->regs[8] != kSysSocket) {
+        return false;
+    }
+
+    const uint64_t domain = regs->regs[0];
+    const uint64_t type = regs->regs[1];
+    const uint64_t protocol = regs->regs[2];
+    const uint64_t base_type = type & kSockTypeMask;
+    const bool is_icmp_v4 = domain == kAfInet && protocol == kIpProtoIcmp;
+    const bool is_icmp_v6 = domain == kAfInet6 && protocol == kIpProtoIcmpv6;
+    if (base_type != kSockRaw || (!is_icmp_v4 && !is_icmp_v6)) {
+        return false;
+    }
+
+    regs->regs[1] = (type & ~kSockTypeMask) | kSockDgram;
+    if (!SetRegs(pid, *regs)) {
+        __android_log_print(ANDROID_LOG_WARN, kLogTag, "Failed to rewrite ping socket for pid=%d", pid);
+        return false;
+    }
+
+    __android_log_print(
+        ANDROID_LOG_INFO,
+        kLogTag,
+        "rewrote ICMP raw socket to datagram ping socket pid=%d domain=%llu protocol=%llu",
+        pid,
+        static_cast<unsigned long long>(domain),
+        static_cast<unsigned long long>(protocol));
+    return true;
+}
+
+bool ApplyEmulatedSyscallReturn(pid_t pid, TraceeState* state) {
+    if (state == nullptr || !state->has_emulated_return) {
+        return false;
+    }
+
+    user_pt_regs regs {};
+    if (!GetRegs(pid, &regs)) {
+        __android_log_print(ANDROID_LOG_WARN, kLogTag, "Failed to read regs for emulated syscall pid=%d", pid);
+        return false;
+    }
+
+    regs.regs[0] = state->emulated_return;
+    if (!SetRegs(pid, regs)) {
+        __android_log_print(ANDROID_LOG_WARN, kLogTag, "Failed to set emulated syscall result pid=%d", pid);
+        return false;
+    }
+
+    state->has_emulated_return = false;
+    state->emulated_return = 0;
+    return true;
+}
+
 int PathArgumentIndexForSyscall(uint64_t syscall_number) {
     switch (syscall_number) {
         case kSysOpenat:
@@ -411,6 +564,9 @@ int ChildTraceeMain(
     char* const envp[] = {
         const_cast<char*>("PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"),
         const_cast<char*>("HOME=/root"),
+        const_cast<char*>("USER=root"),
+        const_cast<char*>("LOGNAME=root"),
+        const_cast<char*>("SHELL=/usr/bin/bash"),
         const_cast<char*>("PWD=/"),
         const_cast<char*>("TERM=xterm-256color"),
         nullptr,
@@ -445,7 +601,7 @@ bool SuppressBlockedSyscall(pid_t pid, TraceeState* state) {
         __android_log_print(
             ANDROID_LOG_WARN,
             kLogTag,
-            "pid=%d blocked syscall=%d arch=0x%x code=%d; returning ENOSYS",
+            "pid=%d blocked syscall=%d arch=0x%x code=%d",
             pid,
             siginfo.si_syscall,
             siginfo.si_arch,
@@ -454,18 +610,34 @@ bool SuppressBlockedSyscall(pid_t pid, TraceeState* state) {
         __android_log_print(
             ANDROID_LOG_WARN,
             kLogTag,
-            "pid=%d blocked syscall=%llu; returning ENOSYS",
+            "pid=%d blocked syscall=%llu",
             pid,
             static_cast<unsigned long long>(regs.regs[8]));
     }
 
-    regs.regs[0] = static_cast<uint64_t>(-ENOSYS);
+    const int blocked_syscall = has_siginfo ? siginfo.si_syscall : static_cast<int>(regs.regs[8]);
+    int64_t return_value = -ENOSYS;
+    switch (blocked_syscall) {
+        case kSysSetuid:
+        case kSysSetgid:
+        case kSysSetresuid:
+        case kSysSetresgid:
+        case kSysSetgroups:
+        case kSysCapset:
+            return_value = 0;
+            break;
+        default:
+            break;
+    }
+
+    regs.regs[0] = static_cast<uint64_t>(return_value);
     if (!SetRegs(pid, regs)) {
-        __android_log_print(ANDROID_LOG_WARN, kLogTag, "Failed to set ENOSYS result for pid=%d", pid);
+        __android_log_print(ANDROID_LOG_WARN, kLogTag, "Failed to set SIGSYS result for pid=%d", pid);
         return false;
     }
     if (state != nullptr) {
         state->expect_entry = true;
+        state->has_emulated_return = false;
     }
     return true;
 }
@@ -551,12 +723,17 @@ int TracerMain(
             if (state.expect_entry) {
                 user_pt_regs regs {};
                 if (GetRegs(pid, &regs)) {
-                    const ExecRewriteResult exec_rewrite_result =
-                        RewriteExecveForDynamicElfIfNeeded(pid, normalized_rootfs, &regs);
-                    if (exec_rewrite_result == ExecRewriteResult::kNotApplicable) {
-                        RewritePathArgumentIfNeeded(pid, normalized_rootfs, &regs);
+                    if (!MaybeEmulateUidGidSyscall(pid, &state, &regs)) {
+                        MaybeRewritePingSocket(pid, &regs);
+                        const ExecRewriteResult exec_rewrite_result =
+                            RewriteExecveForDynamicElfIfNeeded(pid, normalized_rootfs, &regs);
+                        if (exec_rewrite_result == ExecRewriteResult::kNotApplicable) {
+                            RewritePathArgumentIfNeeded(pid, normalized_rootfs, &regs);
+                        }
                     }
                 }
+            } else if (state.has_emulated_return) {
+                ApplyEmulatedSyscallReturn(pid, &state);
             }
             state.expect_entry = !state.expect_entry;
             ResumeSyscall(pid, 0);
