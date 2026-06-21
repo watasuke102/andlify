@@ -51,6 +51,11 @@ constexpr uint64_t kSysGetuid = 174;
 constexpr uint64_t kSysGeteuid = 175;
 constexpr uint64_t kSysGetgid = 176;
 constexpr uint64_t kSysGetegid = 177;
+constexpr uint64_t kSysIoctl = 29;
+constexpr uint64_t kTcgets = 0x5401;
+constexpr uint64_t kTiocgpgrp = 0x540F;
+constexpr uint64_t kTiocspgrp = 0x5410;
+constexpr uint64_t kTiocgwinsz = 0x5413;
 constexpr size_t kPathReadLimit = 4096;
 constexpr uint64_t kStackScratchOffset = 0x800;
 constexpr uint64_t kExecScratchSize = 0x2000;
@@ -340,6 +345,14 @@ void SetEmulatedSyscallReturn(pid_t pid, TraceeState* state, user_pt_regs* regs,
         return;
     }
 
+#if defined(__aarch64__)
+    int syscall_no = -1;
+    iovec io_syscall { &syscall_no, sizeof(syscall_no) };
+    if (ptrace(PTRACE_SETREGSET, pid, reinterpret_cast<void*>(0x404 /* NT_ARM_SYSTEM_CALL */), &io_syscall) != 0) {
+        __android_log_print(ANDROID_LOG_WARN, kLogTag, "Failed to set NT_ARM_SYSTEM_CALL for pid=%d", pid);
+    }
+#endif
+
     state->has_emulated_return = true;
     state->emulated_return = static_cast<uint64_t>(return_value);
 }
@@ -401,6 +414,38 @@ bool MaybeEmulateUidGidSyscall(pid_t pid, TraceeState* state, user_pt_regs* regs
         default:
             return false;
     }
+}
+
+bool MaybeEmulateIoctlSyscall(pid_t pid, TraceeState* state, user_pt_regs* regs) {
+    if (regs == nullptr || regs->regs[8] != kSysIoctl) {
+        return false;
+    }
+
+    const uint64_t request = regs->regs[1];
+    const uint64_t fd = regs->regs[0];
+    
+    char path[256];
+    snprintf(path, sizeof(path), "/proc/%d/fd/%llu", pid, static_cast<unsigned long long>(fd));
+    char target[256];
+    ssize_t len = readlink(path, target, sizeof(target) - 1);
+    if (len > 0) {
+        target[len] = '\0';
+    } else {
+        target[0] = '\0';
+    }
+
+    __android_log_print(ANDROID_LOG_INFO, kLogTag, "ioctl pid=%d fd=%llu request=0x%llx target=%s", pid, static_cast<unsigned long long>(fd), static_cast<unsigned long long>(request), target);
+
+    if (request == kTiocgwinsz || request == kTcgets || request == kTiocgpgrp || request == kTiocspgrp) {
+        if (len > 0) {
+            if (strncmp(target, "pipe:", 5) == 0 || strncmp(target, "socket:", 7) == 0 || strncmp(target, "anon_inode:", 11) == 0) {
+                __android_log_print(ANDROID_LOG_INFO, kLogTag, "emulating ioctl for target=%s", target);
+                SetEmulatedSyscallReturn(pid, state, regs, -ENOTTY);
+                return true;
+            }
+        }
+    }
+    return false;
 }
 
 bool MaybeRewritePingSocket(pid_t pid, user_pt_regs* regs) {
@@ -723,7 +768,8 @@ int TracerMain(
             if (state.expect_entry) {
                 user_pt_regs regs {};
                 if (GetRegs(pid, &regs)) {
-                    if (!MaybeEmulateUidGidSyscall(pid, &state, &regs)) {
+                    if (!MaybeEmulateUidGidSyscall(pid, &state, &regs) &&
+                        !MaybeEmulateIoctlSyscall(pid, &state, &regs)) {
                         MaybeRewritePingSocket(pid, &regs);
                         const ExecRewriteResult exec_rewrite_result =
                             RewriteExecveForDynamicElfIfNeeded(pid, normalized_rootfs, &regs);
