@@ -33,6 +33,14 @@ std::string RewritePathToRootfs(const std::string& normalized_rootfs, const std:
         return original_path;
     }
 
+    if (original_path == "/dev" || original_path == "/dev/") {
+        // Fall through to rewrite to rootfs to avoid Permission Denied on ls /dev
+    } else if (original_path.rfind("/dev/", 0) == 0 ||
+               original_path == "/proc" || original_path.rfind("/proc/", 0) == 0 ||
+               original_path == "/sys" || original_path.rfind("/sys/", 0) == 0) {
+        return original_path;
+    }
+
     return normalized_rootfs + original_path;
 }
 
