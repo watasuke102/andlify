@@ -49,14 +49,18 @@ FetchContent_Declare(
 )
 FetchContent_MakeAvailable(libarchive)
 
-add_library(andlify_chroot SHARED
-    chroot_jni.cpp
+add_library(andlify_core STATIC
     path_rewrite.cpp
     ptrace_memory.cpp
     ptrace_engine.cpp
     rootfs_extractor.cpp
 )
+target_compile_definitions(andlify_core PRIVATE _GNU_SOURCE)
+target_include_directories(andlify_core PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}")
 
+add_library(andlify_chroot SHARED
+    chroot_jni.cpp
+)
 target_compile_definitions(andlify_chroot PRIVATE _GNU_SOURCE)
 target_include_directories(andlify_chroot PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}")
 
@@ -81,9 +85,15 @@ else()
 endif()
 
 target_link_libraries(
-    andlify_chroot
-    PRIVATE
+    andlify_core
+    PUBLIC
     ${LIBARCHIVE_TARGET}
     ${LIBZSTD_TARGET}
     log
+)
+
+target_link_libraries(
+    andlify_chroot
+    PRIVATE
+    andlify_core
 )
