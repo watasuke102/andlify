@@ -15,8 +15,10 @@
 #include <string.h>
 #include <sys/ptrace.h>
 #include <sys/prctl.h>
+#include <sys/socket.h>
 #include <sys/types.h>
 #include <sys/uio.h>
+#include <sys/un.h>
 #include <sys/wait.h>
 #include <unistd.h>
 
@@ -39,6 +41,9 @@ constexpr uint64_t kSysStatx = 291;
 constexpr uint64_t kSysExecve = 221;
 constexpr uint64_t kSysCapset = 91;
 constexpr uint64_t kSysSocket = 198;
+constexpr uint64_t kSysBind = 200;
+constexpr uint64_t kSysConnect = 203;
+constexpr uint64_t kSysSendto = 206;
 constexpr uint64_t kSysSetgid = 144;
 constexpr uint64_t kSysSetuid = 146;
 constexpr uint64_t kSysSetresuid = 147;
@@ -63,6 +68,7 @@ constexpr size_t kMaxExecArgCount = 64;
 constexpr uint64_t kSkippedSyscall = static_cast<uint64_t>(-1);
 constexpr uint64_t kRootUid = 0;
 constexpr uint64_t kRootGid = 0;
+constexpr uint64_t kAfUnix = 1;
 constexpr uint64_t kAfInet = 2;
 constexpr uint64_t kAfInet6 = 10;
 constexpr uint64_t kSockDgram = 2;
@@ -569,6 +575,93 @@ void RewritePathArgumentIfNeeded(pid_t pid, const std::string& normalized_rootfs
     }
 }
 
+void RewriteSockaddrIfNeeded(pid_t pid, const std::string& normalized_rootfs, user_pt_regs* regs) {
+    const uint64_t syscall_number = regs->regs[8];
+    int sockaddr_arg_index = -1;
+    int addrlen_arg_index = -1;
+
+    if (syscall_number == kSysBind || syscall_number == kSysConnect) {
+        sockaddr_arg_index = 1;
+        addrlen_arg_index = 2;
+    } else if (syscall_number == kSysSendto) {
+        sockaddr_arg_index = 4;
+        addrlen_arg_index = 5;
+    } else {
+        return;
+    }
+
+    const uint64_t sockaddr_address = regs->regs[sockaddr_arg_index];
+    const uint64_t addrlen = regs->regs[addrlen_arg_index];
+
+    if (sockaddr_address == 0 || addrlen < sizeof(sa_family_t)) {
+        return;
+    }
+
+    sa_family_t family = 0;
+    if (!ReadTraceeMemory(pid, sockaddr_address, &family, sizeof(family))) {
+        return;
+    }
+
+    if (family != kAfUnix) {
+        return;
+    }
+
+    char first_byte = 0;
+    if (!ReadTraceeMemory(pid, sockaddr_address + sizeof(sa_family_t), &first_byte, 1)) {
+        return;
+    }
+    if (first_byte == '\0') {
+        return;
+    }
+
+    std::string original_path;
+    if (!ReadTraceeCString(pid, sockaddr_address + sizeof(sa_family_t), 108, &original_path)) {
+        return;
+    }
+
+    if (!IsAbsoluteUnixPath(original_path)) {
+        return;
+    }
+
+    const std::string rewritten_path = RewritePathToRootfs(normalized_rootfs, original_path);
+    if (rewritten_path == original_path) {
+        return;
+    }
+
+    __android_log_print(
+        ANDROID_LOG_VERBOSE,
+        kLogTag,
+        "rewrite_sockaddr pid=%d syscall=%llu %s -> %s",
+        pid,
+        static_cast<unsigned long long>(syscall_number),
+        original_path.c_str(),
+        rewritten_path.c_str());
+
+    size_t new_addrlen = sizeof(sa_family_t) + rewritten_path.size() + 1;
+    if (new_addrlen > sizeof(sa_family_t) + 108) {
+        __android_log_print(ANDROID_LOG_WARN, kLogTag, "rewritten unix socket path too long");
+        return;
+    }
+
+    const uint64_t scratch_address = regs->sp > kStackScratchOffset ? regs->sp - kStackScratchOffset : 0;
+    if (scratch_address == 0) {
+        return;
+    }
+
+    if (!WriteTraceeMemory(pid, scratch_address, &family, sizeof(family))) {
+        return;
+    }
+    if (!WriteTraceeMemory(pid, scratch_address + sizeof(family), rewritten_path.c_str(), rewritten_path.size() + 1)) {
+        return;
+    }
+
+    regs->regs[sockaddr_arg_index] = scratch_address;
+    regs->regs[addrlen_arg_index] = new_addrlen;
+    if (!SetRegs(pid, *regs)) {
+        __android_log_print(ANDROID_LOG_WARN, kLogTag, "Failed to set regs for pid=%d sockaddr", pid);
+    }
+}
+
 int ChildTraceeMain(
     const std::string& extract_dst_path,
     const std::string& command_path_in_rootfs,
@@ -775,6 +868,7 @@ int TracerMain(
                             RewriteExecveForDynamicElfIfNeeded(pid, normalized_rootfs, &regs);
                         if (exec_rewrite_result == ExecRewriteResult::kNotApplicable) {
                             RewritePathArgumentIfNeeded(pid, normalized_rootfs, &regs);
+                            RewriteSockaddrIfNeeded(pid, normalized_rootfs, &regs);
                         }
                     }
                 }
