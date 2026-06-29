@@ -67,6 +67,40 @@ void JniStopChroot(JNIEnv* /*env*/, jobject /*thiz*/, jint pid) {
     StopChroot(static_cast<pid_t>(pid));
 }
 
+jint JniStartChrootFunc(
+    JNIEnv* env,
+    jobject /*thiz*/,
+    jstring extract_dst_path,
+    jobject runnable,
+    jint stdin_fd,
+    jint stdout_fd,
+    jint stderr_fd) {
+    const std::string rootfs_path = JStringToUtf8(env, extract_dst_path);
+    
+    auto child_func = [env, runnable]() -> int {
+        jclass runnable_class = env->GetObjectClass(runnable);
+        if (!runnable_class) return 1;
+        jmethodID run_method = env->GetMethodID(runnable_class, "run", "()V");
+        if (!run_method) return 1;
+        
+        env->CallVoidMethod(runnable, run_method);
+        
+        if (env->ExceptionCheck()) {
+            env->ExceptionDescribe();
+            env->ExceptionClear();
+            return 1;
+        }
+        return 0;
+    };
+
+    return static_cast<jint>(StartChrootFunc(
+        rootfs_path,
+        child_func,
+        static_cast<int>(stdin_fd),
+        static_cast<int>(stdout_fd),
+        static_cast<int>(stderr_fd)));
+}
+
 }  // namespace
 
 JNIEXPORT jint JNICALL JNI_OnLoad(JavaVM* vm, void* /*reserved*/) {
@@ -84,6 +118,7 @@ JNIEXPORT jint JNICALL JNI_OnLoad(JavaVM* vm, void* /*reserved*/) {
         {"is_rootfs_extracted", "(Ljava/lang/String;)Z", reinterpret_cast<void*>(JniIsRootfsExtracted)},
         {"extract_rootfs", "(Ljava/lang/String;Ljava/lang/String;)Z", reinterpret_cast<void*>(JniExtractRootfs)},
         {"start_chroot", "(Ljava/lang/String;Ljava/lang/String;III)I", reinterpret_cast<void*>(JniStartChroot)},
+        {"start_chroot_func", "(Ljava/lang/String;Ljava/lang/Runnable;III)I", reinterpret_cast<void*>(JniStartChrootFunc)},
         {"stop_chroot", "(I)V", reinterpret_cast<void*>(JniStopChroot)},
     };
 

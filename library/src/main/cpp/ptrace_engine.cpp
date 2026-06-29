@@ -782,10 +782,7 @@ bool SuppressBlockedSyscall(pid_t pid, TraceeState* state) {
 
 int TracerMain(
     const std::string& extract_dst_path,
-    const std::string& command_path_in_rootfs,
-    int stdin_fd,
-    int stdout_fd,
-    int stderr_fd) {
+    const std::function<int()>& child_spawn_func) {
     prctl(PR_SET_PDEATHSIG, SIGKILL);
 
     const std::string normalized_rootfs = NormalizeRootfsPrefix(extract_dst_path);
@@ -795,7 +792,7 @@ int TracerMain(
         return 1;
     }
     if (tracee_pid == 0) {
-        _exit(ChildTraceeMain(extract_dst_path, command_path_in_rootfs, stdin_fd, stdout_fd, stderr_fd));
+        _exit(child_spawn_func());
     }
 
     int status = 0;
@@ -939,13 +936,65 @@ int StartChroot(
         return -EBADF;
     }
 
+    auto child_spawn_func = [=]() {
+        return ChildTraceeMain(extract_dst_path, command_path_in_rootfs, stdin_fd, stdout_fd, stderr_fd);
+    };
+
     const pid_t tracer_pid = fork();
     if (tracer_pid < 0) {
         return -errno;
     }
 
     if (tracer_pid == 0) {
-        _exit(TracerMain(extract_dst_path, command_path_in_rootfs, stdin_fd, stdout_fd, stderr_fd));
+        _exit(TracerMain(extract_dst_path, child_spawn_func));
+    }
+
+    return tracer_pid;
+}
+
+int StartChrootFunc(
+    const std::string& extract_dst_path,
+    const std::function<int()>& child_func,
+    int stdin_fd,
+    int stdout_fd,
+    int stderr_fd) {
+    if (extract_dst_path.empty() || !child_func) {
+        return -EINVAL;
+    }
+    if (stdin_fd < 0 || stdout_fd < 0 || stderr_fd < 0) {
+        return -EBADF;
+    }
+
+    auto child_spawn_func = [=]() {
+        if (dup2(stdin_fd, STDIN_FILENO) < 0) {
+            return 127;
+        }
+        if (dup2(stdout_fd, STDOUT_FILENO) < 0) {
+            return 127;
+        }
+        if (dup2(stderr_fd, STDERR_FILENO) < 0) {
+            return 127;
+        }
+
+        if (chdir(extract_dst_path.c_str()) != 0) {
+            return 127;
+        }
+
+        if (ptrace(PTRACE_TRACEME, 0, nullptr, nullptr) != 0) {
+            return 127;
+        }
+        raise(SIGSTOP);
+
+        return child_func();
+    };
+
+    const pid_t tracer_pid = fork();
+    if (tracer_pid < 0) {
+        return -errno;
+    }
+
+    if (tracer_pid == 0) {
+        _exit(TracerMain(extract_dst_path, child_spawn_func));
     }
 
     return tracer_pid;
