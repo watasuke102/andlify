@@ -21,7 +21,7 @@ set(ZSTD_BUILD_SHARED OFF CACHE BOOL "" FORCE)
 set(ZSTD_BUILD_STATIC ON CACHE BOOL "" FORCE)
 FetchContent_Declare(
     zstd
-    URL https://github.com/facebook/zstd/archive/refs/tags/v1.5.6.tar.gz
+    URL https://github.com/facebook/zstd/archive/refs/tags/v1.5.7.tar.gz
     SOURCE_SUBDIR build/cmake
 )
 FetchContent_MakeAvailable(zstd)
@@ -43,9 +43,10 @@ set(ENABLE_OPENSSL OFF CACHE BOOL "" FORCE)
 set(ENABLE_NETTLE OFF CACHE BOOL "" FORCE)
 set(ENABLE_ZSTD OFF CACHE BOOL "" FORCE)
 
+set(ENABLE_WERROR OFF CACHE BOOL "" FORCE)
 FetchContent_Declare(
     libarchive
-    URL https://github.com/libarchive/libarchive/releases/download/v3.7.4/libarchive-3.7.4.tar.xz
+    URL https://github.com/libarchive/libarchive/releases/download/v3.8.8/libarchive-3.8.8.tar.xz
 )
 FetchContent_MakeAvailable(libarchive)
 
