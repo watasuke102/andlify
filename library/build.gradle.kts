@@ -57,3 +57,20 @@ kotlin {
 dependencies {
     implementation("androidx.annotation:annotation:1.8.0")
 }
+
+group = "com.github.watasuke102.andlify"
+version = "0.1.0"
+
+afterEvaluate {
+    publishing {
+        publications {
+            create<MavenPublication>("release") {
+                from(components["release"])
+                groupId = group.toString()
+                artifactId = "library"
+                version = version.toString()
+            }
+        }
+    }
+}
+
