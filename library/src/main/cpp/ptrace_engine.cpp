@@ -227,6 +227,63 @@ bool ReadElfInterpreter(
   return false;
 }
 
+bool ReadShebangInterpreter(const std::string& executable_path,
+    std::string* interpreter_path, std::string* interpreter_argument) {
+  if (interpreter_path == nullptr || interpreter_argument == nullptr) {
+    return false;
+  }
+  interpreter_path->clear();
+  interpreter_argument->clear();
+
+  const int fd = open(executable_path.c_str(), O_RDONLY | O_CLOEXEC);
+  if (fd < 0) {
+    return false;
+  }
+
+  char          buffer[256]{};
+  const ssize_t size = read(fd, buffer, sizeof(buffer) - 1);
+  close(fd);
+  if (size < 3 || buffer[0] != '#' || buffer[1] != '!') {
+    return false;
+  }
+
+  size_t end = 2;
+  while (end < static_cast<size_t>(size) && buffer[end] != '\n' &&
+         buffer[end] != '\0') {
+    ++end;
+  }
+  while (end > 2 && (buffer[end - 1] == ' ' || buffer[end - 1] == '\t' ||
+                        buffer[end - 1] == '\r')) {
+    --end;
+  }
+
+  size_t interpreter_start = 2;
+  while (interpreter_start < end && (buffer[interpreter_start] == ' ' ||
+                                        buffer[interpreter_start] == '\t')) {
+    ++interpreter_start;
+  }
+  size_t interpreter_end = interpreter_start;
+  while (interpreter_end < end && buffer[interpreter_end] != ' ' &&
+         buffer[interpreter_end] != '\t') {
+    ++interpreter_end;
+  }
+  if (interpreter_start == interpreter_end) {
+    return false;
+  }
+
+  interpreter_path->assign(
+      buffer + interpreter_start, interpreter_end - interpreter_start);
+  size_t argument_start = interpreter_end;
+  while (argument_start < end &&
+         (buffer[argument_start] == ' ' || buffer[argument_start] == '\t')) {
+    ++argument_start;
+  }
+  if (argument_start < end) {
+    interpreter_argument->assign(buffer + argument_start, end - argument_start);
+  }
+  return IsAbsoluteUnixPath(*interpreter_path);
+}
+
 ExecPlan BuildExecPlan(const std::string& extract_dst_path,
     const std::string&                    command_path_in_rootfs) {
   const std::string real_exec_path =
@@ -239,21 +296,45 @@ ExecPlan BuildExecPlan(const std::string& extract_dst_path,
   }
 
   std::string interpreter_path;
-  if (!ReadElfInterpreter(real_exec_path, &interpreter_path)) {
+  if (ReadElfInterpreter(real_exec_path, &interpreter_path)) {
+    const std::string real_interpreter_path =
+        BuildRealPathInRootfs(extract_dst_path, interpreter_path);
+    if (real_interpreter_path.empty()) {
+      return plan;
+    }
+
+    __android_log_print(ANDROID_LOG_INFO, kLogTag,
+        "Launching dynamic ELF through interpreter: command=%s interpreter=%s",
+        real_exec_path.c_str(), real_interpreter_path.c_str());
+    plan.executable_path = real_interpreter_path;
+    plan.args            = {interpreter_path, real_exec_path};
     return plan;
   }
 
-  const std::string real_interpreter_path =
+  std::string interpreter_argument;
+  if (!ReadShebangInterpreter(
+          real_exec_path, &interpreter_path, &interpreter_argument)) {
+    return plan;
+  }
+
+  const std::string real_script_interpreter =
       BuildRealPathInRootfs(extract_dst_path, interpreter_path);
-  if (real_interpreter_path.empty()) {
+  if (real_script_interpreter.empty()) {
     return plan;
   }
 
-  __android_log_print(ANDROID_LOG_INFO, kLogTag,
-      "Launching dynamic ELF through interpreter: command=%s interpreter=%s",
-      real_exec_path.c_str(), real_interpreter_path.c_str());
-  plan.executable_path = real_interpreter_path;
-  plan.args            = {interpreter_path, real_exec_path};
+  plan.executable_path = real_script_interpreter;
+  plan.args            = {interpreter_path};
+  std::string elf_interpreter;
+  if (ReadElfInterpreter(real_script_interpreter, &elf_interpreter)) {
+    plan.executable_path =
+        BuildRealPathInRootfs(extract_dst_path, elf_interpreter);
+    plan.args = {elf_interpreter, real_script_interpreter};
+  }
+  if (!interpreter_argument.empty()) {
+    plan.args.push_back(interpreter_argument);
+  }
+  plan.args.push_back(real_exec_path);
   return plan;
 }
 
@@ -278,7 +359,7 @@ bool ReadTraceeArgv(
   return false;
 }
 
-ExecRewriteResult RewriteExecveForDynamicElfIfNeeded(
+ExecRewriteResult RewriteExecveIfNeeded(
     pid_t pid, const std::string& normalized_rootfs, user_pt_regs* regs) {
   if (regs == nullptr || regs->regs[8] != kSysExecve) {
     return ExecRewriteResult::kNotApplicable;
@@ -293,22 +374,60 @@ ExecRewriteResult RewriteExecveForDynamicElfIfNeeded(
   std::string original_path;
   if (!ReadTraceeCString(
           pid, source_path_address, kPathReadLimit, &original_path) ||
-      !IsAbsoluteUnixPath(original_path)) {
+      original_path.empty()) {
     return ExecRewriteResult::kNotApplicable;
   }
 
-  const std::string rewritten_path =
-      RewritePathToRootfs(normalized_rootfs, original_path);
-  std::string interpreter_path;
-  if (!ReadElfInterpreter(rewritten_path, &interpreter_path)) {
+  std::string rewritten_path;
+  if (IsAbsoluteUnixPath(original_path)) {
+    rewritten_path = RewritePathToRootfs(normalized_rootfs, original_path);
+  } else {
+    char process_cwd_path[64];
+    snprintf(process_cwd_path, sizeof(process_cwd_path), "/proc/%d/cwd", pid);
+    char          cwd[kPathReadLimit];
+    const ssize_t cwd_size = readlink(process_cwd_path, cwd, sizeof(cwd) - 1);
+    if (cwd_size <= 0) {
+      return ExecRewriteResult::kNotApplicable;
+    }
+    cwd[cwd_size] = '\0';
+    rewritten_path.assign(cwd);
+    if (rewritten_path.back() != '/') {
+      rewritten_path.push_back('/');
+    }
+    rewritten_path.append(original_path);
+  }
+  std::string              interpreter_path;
+  std::string              interpreter_argument;
+  std::string              executable_path;
+  std::vector<std::string> argument_prefix;
+  if (ReadElfInterpreter(rewritten_path, &interpreter_path)) {
+    executable_path =
+        BuildRealPathInRootfs(normalized_rootfs, interpreter_path);
+    argument_prefix = {executable_path, rewritten_path};
+  } else if (ReadShebangInterpreter(
+                 rewritten_path, &interpreter_path, &interpreter_argument)) {
+    const std::string script_interpreter_path =
+        BuildRealPathInRootfs(normalized_rootfs, interpreter_path);
+    executable_path = script_interpreter_path;
+    argument_prefix = {script_interpreter_path};
+
+    std::string elf_interpreter;
+    if (ReadElfInterpreter(script_interpreter_path, &elf_interpreter)) {
+      executable_path =
+          BuildRealPathInRootfs(normalized_rootfs, elf_interpreter);
+      argument_prefix = {executable_path, script_interpreter_path};
+    }
+    if (!interpreter_argument.empty()) {
+      argument_prefix.push_back(interpreter_argument);
+    }
+    argument_prefix.push_back(rewritten_path);
+  } else {
     return ExecRewriteResult::kNotApplicable;
   }
 
-  const std::string rewritten_interpreter_path =
-      BuildRealPathInRootfs(normalized_rootfs, interpreter_path);
-  if (rewritten_interpreter_path.empty()) {
+  if (executable_path.empty()) {
     __android_log_print(ANDROID_LOG_WARN, kLogTag,
-        "Dynamic execve interpreter resolved to empty path for %s",
+        "execve interpreter resolved to empty path for %s",
         rewritten_path.c_str());
     return ExecRewriteResult::kFailed;
   }
@@ -328,38 +447,41 @@ ExecRewriteResult RewriteExecveForDynamicElfIfNeeded(
   const uint64_t scratch_base = regs->sp - kExecScratchSize;
   uint64_t       cursor       = scratch_base;
 
-  const uint64_t interpreter_string_address = cursor;
-  if (!WriteTraceeMemory(pid, cursor, rewritten_interpreter_path.c_str(),
-          rewritten_interpreter_path.size() + 1)) {
-    return ExecRewriteResult::kFailed;
-  }
-  cursor += rewritten_interpreter_path.size() + 1;
-  cursor = AlignUp(cursor, sizeof(uint64_t));
-
-  const uint64_t binary_string_address = cursor;
-  if (!WriteTraceeMemory(
-          pid, cursor, rewritten_path.c_str(), rewritten_path.size() + 1)) {
-    return ExecRewriteResult::kFailed;
-  }
-  cursor += rewritten_path.size() + 1;
-  cursor = AlignUp(cursor, sizeof(uint64_t));
-
   std::vector<uint64_t> rewritten_argv;
-  rewritten_argv.reserve(original_argv.size() + 2);
-  rewritten_argv.push_back(interpreter_string_address);
-  rewritten_argv.push_back(binary_string_address);
+  rewritten_argv.reserve(argument_prefix.size() + original_argv.size());
+  uint64_t executable_string_address = 0;
+  for (size_t i = 0; i < argument_prefix.size(); ++i) {
+    if (cursor + argument_prefix[i].size() + 1 >
+        scratch_base + kExecScratchSize) {
+      return ExecRewriteResult::kFailed;
+    }
+    if (i == 0) {
+      executable_string_address = cursor;
+    }
+    rewritten_argv.push_back(cursor);
+    if (!WriteTraceeMemory(pid, cursor, argument_prefix[i].c_str(),
+            argument_prefix[i].size() + 1)) {
+      return ExecRewriteResult::kFailed;
+    }
+    cursor += argument_prefix[i].size() + 1;
+    cursor = AlignUp(cursor, sizeof(uint64_t));
+  }
   for (size_t i = 1; i < original_argv.size(); ++i) {
     rewritten_argv.push_back(original_argv[i]);
   }
   rewritten_argv.push_back(0);
 
   const uint64_t rewritten_argv_address = cursor;
+  if (rewritten_argv_address + rewritten_argv.size() * sizeof(uint64_t) >
+      scratch_base + kExecScratchSize) {
+    return ExecRewriteResult::kFailed;
+  }
   if (!WriteTraceeMemory(pid, rewritten_argv_address, rewritten_argv.data(),
           rewritten_argv.size() * sizeof(uint64_t))) {
     return ExecRewriteResult::kFailed;
   }
 
-  regs->regs[0] = interpreter_string_address;
+  regs->regs[0] = executable_string_address;
   regs->regs[1] = rewritten_argv_address;
   if (!SetRegs(pid, *regs)) {
     return ExecRewriteResult::kFailed;
@@ -367,7 +489,7 @@ ExecRewriteResult RewriteExecveForDynamicElfIfNeeded(
 
   __android_log_print(ANDROID_LOG_INFO, kLogTag,
       "Rewrote execve to interpreter pid=%d command=%s interpreter=%s", pid,
-      rewritten_path.c_str(), rewritten_interpreter_path.c_str());
+      rewritten_path.c_str(), executable_path.c_str());
   return ExecRewriteResult::kApplied;
 }
 
@@ -912,8 +1034,7 @@ int TracerMain(const std::string& extract_dst_path,
               !MaybeEmulateIoctlSyscall(pid, &state, &regs)) {
             MaybeRewritePingSocket(pid, &regs);
             const ExecRewriteResult exec_rewrite_result =
-                RewriteExecveForDynamicElfIfNeeded(
-                    pid, normalized_rootfs, &regs);
+                RewriteExecveIfNeeded(pid, normalized_rootfs, &regs);
             if (exec_rewrite_result == ExecRewriteResult::kNotApplicable) {
               RewritePathArgumentsIfNeeded(pid, normalized_rootfs, &regs);
               RewriteSockaddrIfNeeded(pid, normalized_rootfs, &regs);
