@@ -40,6 +40,7 @@ constexpr uint64_t kSysFaccessat = 48;
 constexpr uint64_t kSysChdir = 49;
 constexpr uint64_t kSysFchmodat = 53;
 constexpr uint64_t kSysFchownat = 54;
+constexpr uint64_t kSysFchown = 55;
 constexpr uint64_t kSysOpenat = 56;
 constexpr uint64_t kSysReadlinkat = 78;
 constexpr uint64_t kSysNewfstatat = 79;
@@ -415,6 +416,8 @@ bool MaybeEmulateUidGidSyscall(pid_t pid, TraceeState* state, user_pt_regs* regs
         case kSysSetresgid:
         case kSysSetgroups:
         case kSysCapset:
+        case kSysFchownat:
+        case kSysFchown:
             SetEmulatedSyscallReturn(pid, state, regs, 0);
             return true;
         case kSysGetresuid: {
