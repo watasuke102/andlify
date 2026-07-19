@@ -76,6 +76,15 @@ constexpr uint64_t kSockRaw = 3;
 constexpr uint64_t kSockTypeMask = 0xf;
 constexpr uint64_t kIpProtoIcmp = 1;
 constexpr uint64_t kIpProtoIcmpv6 = 58;
+constexpr const char* kDefaultEnvironment[][2] = {
+    {"PATH", "/usr/bin:/bin:/usr/sbin:/sbin"},
+    {"HOME", "/root"},
+    {"USER", "root"},
+    {"LOGNAME", "root"},
+    {"PWD", "/"},
+    {"TERM", "xterm-256color"},
+    {"TMPDIR", "/tmp"},
+};
 
 struct TraceeState {
     bool expect_entry = true;
@@ -88,6 +97,19 @@ struct ExecPlan {
     std::string executable_path;
     std::vector<std::string> args;
 };
+
+bool ResetEnvironment() {
+    if (clearenv() != 0) {
+        return false;
+    }
+
+    for (const auto& variable : kDefaultEnvironment) {
+        if (setenv(variable[0], variable[1], 1) != 0) {
+            return false;
+        }
+    }
+    return true;
+}
 
 enum class ExecRewriteResult {
     kNotApplicable,
@@ -684,6 +706,10 @@ int ChildTraceeMain(
         return 127;
     }
 
+    if (!ResetEnvironment()) {
+        return 127;
+    }
+
     const ExecPlan exec_plan = BuildExecPlan(extract_dst_path, command_path_in_rootfs);
     if (exec_plan.executable_path.empty() || exec_plan.args.empty()) {
         return 127;
@@ -701,17 +727,7 @@ int ChildTraceeMain(
     }
     argv.push_back(nullptr);
 
-    char* const envp[] = {
-        const_cast<char*>("PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"),
-        const_cast<char*>("HOME=/root"),
-        const_cast<char*>("USER=root"),
-        const_cast<char*>("LOGNAME=root"),
-        const_cast<char*>("SHELL=/usr/bin/bash"),
-        const_cast<char*>("PWD=/"),
-        const_cast<char*>("TERM=xterm-256color"),
-        nullptr,
-    };
-    execve(exec_plan.executable_path.c_str(), argv.data(), envp);
+    execv(exec_plan.executable_path.c_str(), argv.data());
     __android_log_print(
         ANDROID_LOG_ERROR,
         kLogTag,
@@ -975,6 +991,10 @@ int StartChrootFunc(
         }
 
         if (chdir(extract_dst_path.c_str()) != 0) {
+            return 127;
+        }
+
+        if (!ResetEnvironment()) {
             return 127;
         }
 
