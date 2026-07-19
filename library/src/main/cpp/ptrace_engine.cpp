@@ -52,6 +52,7 @@ constexpr uint64_t kSysSetresgid = 149;
 constexpr uint64_t kSysGetresgid = 150;
 constexpr uint64_t kSysGetgroups = 158;
 constexpr uint64_t kSysSetgroups = 159;
+constexpr uint64_t kSysGetpid = 172;
 constexpr uint64_t kSysGetuid = 174;
 constexpr uint64_t kSysGeteuid = 175;
 constexpr uint64_t kSysGetgid = 176;
@@ -65,7 +66,6 @@ constexpr size_t kPathReadLimit = 4096;
 constexpr uint64_t kStackScratchOffset = 0x800;
 constexpr uint64_t kExecScratchSize = 0x2000;
 constexpr size_t kMaxExecArgCount = 64;
-constexpr uint64_t kSkippedSyscall = static_cast<uint64_t>(-1);
 constexpr uint64_t kRootUid = 0;
 constexpr uint64_t kRootGid = 0;
 constexpr uint64_t kAfUnix = 1;
@@ -345,14 +345,14 @@ void SetEmulatedSyscallReturn(pid_t pid, TraceeState* state, user_pt_regs* regs,
         return;
     }
 
-    regs->regs[8] = kSkippedSyscall;
+    regs->regs[8] = kSysGetpid;
     if (!SetRegs(pid, *regs)) {
         __android_log_print(ANDROID_LOG_WARN, kLogTag, "Failed to skip syscall for pid=%d", pid);
         return;
     }
 
 #if defined(__aarch64__)
-    int syscall_no = -1;
+    int syscall_no = static_cast<int>(kSysGetpid);
     iovec io_syscall { &syscall_no, sizeof(syscall_no) };
     if (ptrace(PTRACE_SETREGSET, pid, reinterpret_cast<void*>(0x404 /* NT_ARM_SYSTEM_CALL */), &io_syscall) != 0) {
         __android_log_print(ANDROID_LOG_WARN, kLogTag, "Failed to set NT_ARM_SYSTEM_CALL for pid=%d", pid);
@@ -490,20 +490,22 @@ bool ApplyEmulatedSyscallReturn(pid_t pid, TraceeState* state) {
         return false;
     }
 
+    const uint64_t return_value = state->emulated_return;
+    state->has_emulated_return = false;
+    state->emulated_return = 0;
+
     user_pt_regs regs {};
     if (!GetRegs(pid, &regs)) {
         __android_log_print(ANDROID_LOG_WARN, kLogTag, "Failed to read regs for emulated syscall pid=%d", pid);
         return false;
     }
 
-    regs.regs[0] = state->emulated_return;
+    regs.regs[0] = return_value;
     if (!SetRegs(pid, regs)) {
         __android_log_print(ANDROID_LOG_WARN, kLogTag, "Failed to set emulated syscall result pid=%d", pid);
         return false;
     }
 
-    state->has_emulated_return = false;
-    state->emulated_return = 0;
     return true;
 }
 
@@ -754,21 +756,11 @@ bool SuppressBlockedSyscall(pid_t pid, TraceeState* state) {
     }
 
     const int blocked_syscall = has_siginfo ? siginfo.si_syscall : static_cast<int>(regs.regs[8]);
-    int64_t return_value = -ENOSYS;
-    switch (blocked_syscall) {
-        case kSysSetuid:
-        case kSysSetgid:
-        case kSysSetresuid:
-        case kSysSetresgid:
-        case kSysSetgroups:
-        case kSysCapset:
-            return_value = 0;
-            break;
-        default:
-            break;
-    }
+    const bool is_emulated_syscall =
+        static_cast<uint64_t>(blocked_syscall) == kSysGetpid && state != nullptr && state->has_emulated_return;
+    const uint64_t return_value = is_emulated_syscall ? state->emulated_return : static_cast<uint64_t>(-ENOSYS);
 
-    regs.regs[0] = static_cast<uint64_t>(return_value);
+    regs.regs[0] = return_value;
     if (!SetRegs(pid, regs)) {
         __android_log_print(ANDROID_LOG_WARN, kLogTag, "Failed to set SIGSYS result for pid=%d", pid);
         return false;
@@ -776,6 +768,7 @@ bool SuppressBlockedSyscall(pid_t pid, TraceeState* state) {
     if (state != nullptr) {
         state->expect_entry = true;
         state->has_emulated_return = false;
+        state->emulated_return = 0;
     }
     return true;
 }
@@ -855,22 +848,16 @@ int TracerMain(
         const int signal_number = WSTOPSIG(wait_status);
         const unsigned event = static_cast<unsigned>(wait_status) >> 16U;
         if (signal_number == (SIGTRAP | 0x80)) {
-            user_pt_regs regs{};
-            const bool has_regs = GetRegs(pid, &regs);
-            if (has_regs && regs.regs[8] == kSysCapset && regs.regs[0] == static_cast<uint64_t>(-ENOSYS)) {
-                regs.regs[0] = 0;
-                if (!SetRegs(pid, regs)) {
-                    __android_log_print(ANDROID_LOG_WARN, kLogTag, "Failed to override capset result for pid=%d", pid);
-                } else {
-                    state.expect_entry = true;
-                    state.has_emulated_return = false;
-                    ResumeSyscall(pid, 0);
-                    continue;
-                }
+            if (state.has_emulated_return) {
+                ApplyEmulatedSyscallReturn(pid, &state);
+                state.expect_entry = true;
+                ResumeSyscall(pid, 0);
+                continue;
             }
 
             if (state.expect_entry) {
-                if (has_regs) {
+                user_pt_regs regs {};
+                if (GetRegs(pid, &regs)) {
                     if (!MaybeEmulateUidGidSyscall(pid, &state, &regs) &&
                         !MaybeEmulateIoctlSyscall(pid, &state, &regs)) {
                         MaybeRewritePingSocket(pid, &regs);
@@ -882,8 +869,6 @@ int TracerMain(
                         }
                     }
                 }
-            } else if (state.has_emulated_return) {
-                ApplyEmulatedSyscallReturn(pid, &state);
             }
             state.expect_entry = !state.expect_entry;
             ResumeSyscall(pid, 0);
