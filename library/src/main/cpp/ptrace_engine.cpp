@@ -36,6 +36,7 @@ constexpr uint64_t    kSysUnlinkat             = 35;
 constexpr uint64_t    kSysSymlinkat            = 36;
 constexpr uint64_t    kSysLinkat               = 37;
 constexpr uint64_t    kSysRenameat             = 38;
+constexpr uint64_t    kSysStatfs               = 43;
 constexpr uint64_t    kSysFaccessat            = 48;
 constexpr uint64_t    kSysChdir                = 49;
 constexpr uint64_t    kSysFchmodat             = 53;
@@ -610,6 +611,7 @@ void RewritePathArgumentsIfNeeded(
   switch (syscall_number) {
     case kSysChdir:
     case kSysExecve:
+    case kSysStatfs:
       RewritePathArgument(pid, normalized_rootfs, regs, 0, kStackScratchOffset);
       return;
     case kSysMknodat:
