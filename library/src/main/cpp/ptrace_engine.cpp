@@ -855,9 +855,22 @@ int TracerMain(
         const int signal_number = WSTOPSIG(wait_status);
         const unsigned event = static_cast<unsigned>(wait_status) >> 16U;
         if (signal_number == (SIGTRAP | 0x80)) {
+            user_pt_regs regs{};
+            const bool has_regs = GetRegs(pid, &regs);
+            if (has_regs && regs.regs[8] == kSysCapset && regs.regs[0] == static_cast<uint64_t>(-ENOSYS)) {
+                regs.regs[0] = 0;
+                if (!SetRegs(pid, regs)) {
+                    __android_log_print(ANDROID_LOG_WARN, kLogTag, "Failed to override capset result for pid=%d", pid);
+                } else {
+                    state.expect_entry = true;
+                    state.has_emulated_return = false;
+                    ResumeSyscall(pid, 0);
+                    continue;
+                }
+            }
+
             if (state.expect_entry) {
-                user_pt_regs regs {};
-                if (GetRegs(pid, &regs)) {
+                if (has_regs) {
                     if (!MaybeEmulateUidGidSyscall(pid, &state, &regs) &&
                         !MaybeEmulateIoctlSyscall(pid, &state, &regs)) {
                         MaybeRewritePingSocket(pid, &regs);
