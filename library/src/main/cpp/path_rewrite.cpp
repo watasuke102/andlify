@@ -16,6 +16,16 @@ bool IsAbsoluteUnixPath(const std::string& path) {
     return !path.empty() && path[0] == '/';
 }
 
+bool IsPassthroughUnixPath(const std::string& path) {
+  if (path == "/dev" || path == "/dev/") {
+    // Rewriting this directory avoids Permission Denied on ls /dev.
+    return false;
+  }
+  return path.rfind("/dev/", 0) == 0 || path == "/proc" ||
+         path.rfind("/proc/", 0) == 0 || path == "/sys" ||
+         path.rfind("/sys/", 0) == 0;
+}
+
 std::string RewritePathToRootfs(const std::string& normalized_rootfs, const std::string& original_path) {
     if (!IsAbsoluteUnixPath(original_path)) {
         return original_path;
@@ -33,12 +43,8 @@ std::string RewritePathToRootfs(const std::string& normalized_rootfs, const std:
         return original_path;
     }
 
-    if (original_path == "/dev" || original_path == "/dev/") {
-        // Fall through to rewrite to rootfs to avoid Permission Denied on ls /dev
-    } else if (original_path.rfind("/dev/", 0) == 0 ||
-               original_path == "/proc" || original_path.rfind("/proc/", 0) == 0 ||
-               original_path == "/sys" || original_path.rfind("/sys/", 0) == 0) {
-        return original_path;
+    if (IsPassthroughUnixPath(original_path)) {
+      return original_path;
     }
 
     return normalized_rootfs + original_path;

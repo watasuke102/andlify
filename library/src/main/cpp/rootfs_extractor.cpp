@@ -1,5 +1,7 @@
 #include "rootfs_extractor.h"
 
+#include "path_rewrite.h"
+
 #include <android/log.h>
 #include <archive.h>
 #include <archive_entry.h>
@@ -184,6 +186,57 @@ bool NormalizeArchivePath(const char* archive_path, std::string* out_relative_pa
     }
     *out_relative_path = normalized;
     return true;
+}
+
+std::string ResolveRelativeSymlinkTarget(
+    const std::string& link_path, const char* symlink_target) {
+  if (symlink_target == nullptr || symlink_target[0] == '\0' ||
+      symlink_target[0] == '/') {
+    return "";
+  }
+
+  std::vector<std::string> components;
+  const size_t             last_slash = link_path.rfind('/');
+  const std::string        parent_path =
+      last_slash == std::string::npos ? "" : link_path.substr(0, last_slash);
+  size_t start = 0;
+  while (start < parent_path.size()) {
+    const size_t slash = parent_path.find('/', start);
+    const size_t end = slash == std::string::npos ? parent_path.size() : slash;
+    components.emplace_back(parent_path.substr(start, end - start));
+    if (slash == std::string::npos) {
+      break;
+    }
+    start = slash + 1;
+  }
+
+  const std::string target(symlink_target);
+  start = 0;
+  while (start <= target.size()) {
+    const size_t      slash = target.find('/', start);
+    const size_t      end = slash == std::string::npos ? target.size() : slash;
+    const std::string component = target.substr(start, end - start);
+    if (component == "..") {
+      if (!components.empty()) {
+        components.pop_back();
+      }
+    } else if (!component.empty() && component != ".") {
+      components.emplace_back(component);
+    }
+    if (slash == std::string::npos) {
+      break;
+    }
+    start = slash + 1;
+  }
+
+  std::string resolved = "/";
+  for (size_t i = 0; i < components.size(); ++i) {
+    if (i != 0) {
+      resolved.push_back('/');
+    }
+    resolved.append(components[i]);
+  }
+  return resolved;
 }
 
 bool CopyArchiveData(struct archive* source, struct archive* destination) {
@@ -462,6 +515,13 @@ bool ExtractRootfs(const std::string& archive_path, const std::string& extract_d
             __android_log_print(ANDROID_LOG_ERROR, kLogTag, "Unsafe path in archive: %s", archive_entry_pathname(entry));
             ok = false;
             break;
+        }
+
+        const std::string resolved_symlink_target =
+            ResolveRelativeSymlinkTarget(
+                relative_path, archive_entry_symlink(entry));
+        if (IsPassthroughUnixPath(resolved_symlink_target)) {
+          archive_entry_set_symlink(entry, resolved_symlink_target.c_str());
         }
 
         const std::string target_path = relative_path == "." ? extract_dst_path : JoinPath(extract_dst_path, relative_path);
