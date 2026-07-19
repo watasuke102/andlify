@@ -30,14 +30,24 @@
 namespace {
 
 constexpr const char* kLogTag = "andlify-ptrace";
-constexpr uint64_t kSysOpenat = 56;
-constexpr uint64_t kSysChdir = 49;
+constexpr uint64_t kSysMknodat = 33;
+constexpr uint64_t kSysMkdirat = 34;
+constexpr uint64_t kSysUnlinkat = 35;
+constexpr uint64_t kSysSymlinkat = 36;
+constexpr uint64_t kSysLinkat = 37;
+constexpr uint64_t kSysRenameat = 38;
 constexpr uint64_t kSysFaccessat = 48;
-constexpr uint64_t kSysNewfstatat = 79;
+constexpr uint64_t kSysChdir = 49;
+constexpr uint64_t kSysFchmodat = 53;
+constexpr uint64_t kSysFchownat = 54;
+constexpr uint64_t kSysOpenat = 56;
 constexpr uint64_t kSysReadlinkat = 78;
-constexpr uint64_t kSysFaccessat2 = 439;
-constexpr uint64_t kSysOpenat2 = 437;
+constexpr uint64_t kSysNewfstatat = 79;
+constexpr uint64_t kSysUtimensat = 88;
+constexpr uint64_t kSysRenameat2 = 276;
 constexpr uint64_t kSysStatx = 291;
+constexpr uint64_t kSysOpenat2 = 437;
+constexpr uint64_t kSysFaccessat2 = 439;
 constexpr uint64_t kSysExecve = 221;
 constexpr uint64_t kSysCapset = 91;
 constexpr uint64_t kSysSocket = 198;
@@ -531,31 +541,12 @@ bool ApplyEmulatedSyscallReturn(pid_t pid, TraceeState* state) {
     return true;
 }
 
-int PathArgumentIndexForSyscall(uint64_t syscall_number) {
-    switch (syscall_number) {
-        case kSysOpenat:
-        case kSysOpenat2:
-            return 1;
-        case kSysFaccessat:
-        case kSysFaccessat2:
-        case kSysNewfstatat:
-        case kSysReadlinkat:
-        case kSysStatx:
-            return 1;
-        case kSysChdir:
-        case kSysExecve:
-            return 0;
-        default:
-            return -1;
-    }
-}
-
-void RewritePathArgumentIfNeeded(pid_t pid, const std::string& normalized_rootfs, user_pt_regs* regs) {
-    const int arg_index = PathArgumentIndexForSyscall(regs->regs[8]);
-    if (arg_index < 0) {
-        return;
-    }
-
+void RewritePathArgument(
+    pid_t pid,
+    const std::string& normalized_rootfs,
+    user_pt_regs* regs,
+    int arg_index,
+    uint64_t scratch_offset) {
     const uint64_t source_path_address = regs->regs[arg_index];
     if (source_path_address == 0) {
         return;
@@ -583,7 +574,7 @@ void RewritePathArgumentIfNeeded(pid_t pid, const std::string& normalized_rootfs
         original_path.c_str(),
         rewritten_path.c_str());
 
-    const uint64_t scratch_address = regs->sp > kStackScratchOffset ? regs->sp - kStackScratchOffset : 0;
+    const uint64_t scratch_address = regs->sp > scratch_offset ? regs->sp - scratch_offset : 0;
     if (scratch_address != 0 &&
         WriteTraceeMemory(pid, scratch_address, rewritten_path.c_str(), rewritten_path.size() + 1)) {
         regs->regs[arg_index] = scratch_address;
@@ -596,6 +587,42 @@ void RewritePathArgumentIfNeeded(pid_t pid, const std::string& normalized_rootfs
     if (rewritten_path.size() <= original_path.size() &&
         WriteTraceeMemory(pid, source_path_address, rewritten_path.c_str(), rewritten_path.size() + 1)) {
         return;
+    }
+}
+
+void RewritePathArgumentsIfNeeded(pid_t pid, const std::string& normalized_rootfs, user_pt_regs* regs) {
+    const uint64_t syscall_number = regs->regs[8];
+    switch (syscall_number) {
+        case kSysChdir:
+        case kSysExecve:
+            RewritePathArgument(pid, normalized_rootfs, regs, 0, kStackScratchOffset);
+            return;
+        case kSysMknodat:
+        case kSysMkdirat:
+        case kSysUnlinkat:
+        case kSysFaccessat:
+        case kSysFchmodat:
+        case kSysFchownat:
+        case kSysOpenat:
+        case kSysReadlinkat:
+        case kSysNewfstatat:
+        case kSysUtimensat:
+        case kSysStatx:
+        case kSysOpenat2:
+        case kSysFaccessat2:
+            RewritePathArgument(pid, normalized_rootfs, regs, 1, kStackScratchOffset);
+            return;
+        case kSysSymlinkat:
+            RewritePathArgument(pid, normalized_rootfs, regs, 2, kStackScratchOffset);
+            return;
+        case kSysLinkat:
+        case kSysRenameat:
+        case kSysRenameat2:
+            RewritePathArgument(pid, normalized_rootfs, regs, 1, kStackScratchOffset);
+            RewritePathArgument(pid, normalized_rootfs, regs, 3, kStackScratchOffset * 2);
+            return;
+        default:
+            return;
     }
 }
 
@@ -880,7 +907,7 @@ int TracerMain(
                         const ExecRewriteResult exec_rewrite_result =
                             RewriteExecveForDynamicElfIfNeeded(pid, normalized_rootfs, &regs);
                         if (exec_rewrite_result == ExecRewriteResult::kNotApplicable) {
-                            RewritePathArgumentIfNeeded(pid, normalized_rootfs, &regs);
+                            RewritePathArgumentsIfNeeded(pid, normalized_rootfs, &regs);
                             RewriteSockaddrIfNeeded(pid, normalized_rootfs, &regs);
                         }
                     }
