@@ -269,6 +269,44 @@ bool CopyArchiveData(struct archive* source, struct archive* destination) {
     }
 }
 
+bool CopyFileDataToArchive(
+    const std::string& source_path, struct archive* destination) {
+  const int source_fd = open(source_path.c_str(), O_RDONLY | O_CLOEXEC);
+  if (source_fd < 0) {
+    LogErrno("CopyFileDataToArchive: open failed", source_path);
+    return false;
+  }
+
+  std::vector<char> buffer(64 * 1024);
+  la_int64_t        offset = 0;
+  while (true) {
+    const ssize_t read_size = read(source_fd, buffer.data(), buffer.size());
+    if (read_size < 0) {
+      if (errno == EINTR) {
+        continue;
+      }
+      LogErrno("CopyFileDataToArchive: read failed", source_path);
+      close(source_fd);
+      return false;
+    }
+    if (read_size == 0) {
+      close(source_fd);
+      return true;
+    }
+
+    const int write_status = archive_write_data_block(
+        destination, buffer.data(), static_cast<size_t>(read_size), offset);
+    if (write_status != ARCHIVE_OK) {
+      __android_log_print(ANDROID_LOG_ERROR, kLogTag,
+          "CopyFileDataToArchive: write failed: %s",
+          archive_error_string(destination));
+      close(source_fd);
+      return false;
+    }
+    offset += read_size;
+  }
+}
+
 std::string MarkerPath(const std::string& extract_dst_path) {
     return JoinPath(extract_dst_path, kReadyMarker);
 }
@@ -517,6 +555,39 @@ bool ExtractRootfs(const std::string& archive_path, const std::string& extract_d
             break;
         }
 
+        std::string hardlink_source_path;
+        if (const char* hardlink_target = archive_entry_hardlink(entry);
+            hardlink_target != nullptr) {
+          std::string relative_hardlink_path;
+          if (!NormalizeArchivePath(hardlink_target, &relative_hardlink_path)) {
+            __android_log_print(ANDROID_LOG_ERROR, kLogTag,
+                "Unsafe hard-link target in archive: %s", hardlink_target);
+            ok = false;
+            break;
+          }
+          hardlink_source_path =
+              relative_hardlink_path == "." ?
+                  extract_dst_path :
+                  JoinPath(extract_dst_path, relative_hardlink_path);
+
+          struct stat source_stat{};
+          if (stat(hardlink_source_path.c_str(), &source_stat) != 0) {
+            LogErrno("ExtractRootfs: hard-link source is unavailable",
+                hardlink_source_path);
+            ok = false;
+            break;
+          }
+          if (!S_ISREG(source_stat.st_mode)) {
+            __android_log_print(ANDROID_LOG_ERROR, kLogTag,
+                "ExtractRootfs: hard-link source is not a regular file: %s",
+                hardlink_source_path.c_str());
+            ok = false;
+            break;
+          }
+          archive_entry_set_hardlink(entry, nullptr);
+          archive_entry_set_size(entry, source_stat.st_size);
+        }
+
         const std::string resolved_symlink_target =
             ResolveRelativeSymlinkTarget(
                 relative_path, archive_entry_symlink(entry));
@@ -535,9 +606,15 @@ bool ExtractRootfs(const std::string& archive_path, const std::string& extract_d
                 "archive_write_header warning/error: %s",
                 archive_error_string(archive_writer));
         }
-        if (write_header_status == ARCHIVE_OK && !CopyArchiveData(archive_reader, archive_writer)) {
+        if (write_header_status == ARCHIVE_OK) {
+          const bool copied =
+              hardlink_source_path.empty() ?
+                  CopyArchiveData(archive_reader, archive_writer) :
+                  CopyFileDataToArchive(hardlink_source_path, archive_writer);
+          if (!copied) {
             ok = false;
             break;
+          }
         }
 
         const int finish_status = archive_write_finish_entry(archive_writer);
