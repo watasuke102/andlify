@@ -75,6 +75,13 @@ constexpr uint64_t    kSysGetgid               = 176;
 constexpr uint64_t    kSysGetegid              = 177;
 constexpr uint64_t    kSysIoctl                = 29;
 constexpr uint64_t    kTcgets                  = 0x5401;
+constexpr uint64_t    kTcsets                  = 0x5402;
+constexpr uint64_t    kTcsetsw                 = 0x5403;
+constexpr uint64_t    kTcsetsf                 = 0x5404;
+constexpr uint64_t    kTcgets2                 = 0x802c542A;
+constexpr uint64_t    kTcsets2                 = 0x402c542B;
+constexpr uint64_t    kTcsetsw2                = 0x402c542C;
+constexpr uint64_t    kTcsetsf2                = 0x402c542D;
 constexpr uint64_t    kTiocgpgrp               = 0x540F;
 constexpr uint64_t    kTiocspgrp               = 0x5410;
 constexpr uint64_t    kTiocgwinsz              = 0x5413;
@@ -623,7 +630,7 @@ bool MaybeEmulatePrctlSyscall(
   return true;
 }
 
-bool MaybeEmulateIoctlSyscall(
+bool MaybeHandleIoctlSyscall(
     pid_t pid, TraceeState* state, user_pt_regs* regs) {
   if (regs == nullptr || regs->regs[8] != kSysIoctl) {
     return false;
@@ -647,6 +654,37 @@ bool MaybeEmulateIoctlSyscall(
       "ioctl pid=%d fd=%llu request=0x%llx target=%s", pid,
       static_cast<unsigned long long>(fd),
       static_cast<unsigned long long>(request), target);
+
+  uint64_t rewritten_request = 0;
+  if (strncmp(target, "/dev/pts/", 9) == 0) {
+    switch (request) {
+      case kTcgets2:
+        rewritten_request = kTcgets;
+        break;
+      case kTcsets2:
+        rewritten_request = kTcsets;
+        break;
+      case kTcsetsw2:
+        rewritten_request = kTcsetsw;
+        break;
+      case kTcsetsf2:
+        rewritten_request = kTcsetsf;
+        break;
+      default:
+        break;
+    }
+  }
+  if (rewritten_request != 0) {
+    regs->regs[1] = rewritten_request;
+    if (!SetRegs(pid, *regs)) {
+      return false;
+    }
+    __android_log_print(ANDROID_LOG_INFO, kLogTag,
+        "rewrote devpts ioctl pid=%d request=0x%llx to 0x%llx", pid,
+        static_cast<unsigned long long>(request),
+        static_cast<unsigned long long>(rewritten_request));
+    return true;
+  }
 
   if (request == kTiocgwinsz || request == kTcgets || request == kTiocgpgrp ||
       request == kTiocspgrp) {
@@ -1107,7 +1145,7 @@ int TracerMain(const std::string& extract_dst_path,
         if (is_syscall_entry) {
           if (!MaybeEmulatePrctlSyscall(pid, &state, &regs) &&
               !MaybeEmulateUidGidSyscall(pid, &state, &regs) &&
-              !MaybeEmulateIoctlSyscall(pid, &state, &regs)) {
+              !MaybeHandleIoctlSyscall(pid, &state, &regs)) {
             MaybeRewriteAcceptSyscall(pid, &regs);
             MaybeRewritePingSocket(pid, &regs);
             const ExecRewriteResult exec_rewrite_result =
