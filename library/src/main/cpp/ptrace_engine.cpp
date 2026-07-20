@@ -55,8 +55,10 @@ constexpr uint64_t    kSysExecve               = 221;
 constexpr uint64_t    kSysCapset               = 91;
 constexpr uint64_t    kSysSocket               = 198;
 constexpr uint64_t    kSysBind                 = 200;
+constexpr uint64_t    kSysAccept               = 202;
 constexpr uint64_t    kSysConnect              = 203;
 constexpr uint64_t    kSysSendto               = 206;
+constexpr uint64_t    kSysAccept4              = 242;
 constexpr uint64_t    kSysSetgid               = 144;
 constexpr uint64_t    kSysSetuid               = 146;
 constexpr uint64_t    kSysSetresuid            = 147;
@@ -495,32 +497,55 @@ ExecRewriteResult RewriteExecveIfNeeded(
   return ExecRewriteResult::kApplied;
 }
 
-void SetEmulatedSyscallReturn(
-    pid_t pid, TraceeState* state, user_pt_regs* regs, int64_t return_value) {
-  if (state == nullptr || regs == nullptr) {
-    return;
+bool SetSyscallNumber(pid_t pid, user_pt_regs* regs, uint64_t syscall_number) {
+  if (regs == nullptr) {
+    return false;
   }
 
-  regs->regs[8] = kSysGetpid;
+  regs->regs[8] = syscall_number;
   if (!SetRegs(pid, *regs)) {
     __android_log_print(
-        ANDROID_LOG_WARN, kLogTag, "Failed to skip syscall for pid=%d", pid);
-    return;
+        ANDROID_LOG_WARN, kLogTag, "Failed to set syscall for pid=%d", pid);
+    return false;
   }
 
 #if defined(__aarch64__)
-  int   syscall_no = static_cast<int>(kSysGetpid);
+  int   syscall_no = static_cast<int>(syscall_number);
   iovec io_syscall{&syscall_no, sizeof(syscall_no)};
   if (ptrace(PTRACE_SETREGSET, pid,
           reinterpret_cast<void*>(0x404 /* NT_ARM_SYSTEM_CALL */),
           &io_syscall) != 0) {
     __android_log_print(ANDROID_LOG_WARN, kLogTag,
         "Failed to set NT_ARM_SYSTEM_CALL for pid=%d", pid);
+    return false;
   }
 #endif
 
+  return true;
+}
+
+void SetEmulatedSyscallReturn(
+    pid_t pid, TraceeState* state, user_pt_regs* regs, int64_t return_value) {
+  if (state == nullptr || !SetSyscallNumber(pid, regs, kSysGetpid)) {
+    return;
+  }
+
   state->has_emulated_return = true;
   state->emulated_return     = static_cast<uint64_t>(return_value);
+}
+
+void MaybeRewriteAcceptSyscall(pid_t pid, user_pt_regs* regs) {
+  if (regs == nullptr || regs->regs[8] != kSysAccept) {
+    return;
+  }
+
+  regs->regs[3] = 0;
+  if (!SetSyscallNumber(pid, regs, kSysAccept4)) {
+    return;
+  }
+
+  __android_log_print(
+      ANDROID_LOG_INFO, kLogTag, "Rewrote accept to accept4 for pid=%d", pid);
 }
 
 bool MaybeEmulateUidGidSyscall(
@@ -1083,6 +1108,7 @@ int TracerMain(const std::string& extract_dst_path,
           if (!MaybeEmulatePrctlSyscall(pid, &state, &regs) &&
               !MaybeEmulateUidGidSyscall(pid, &state, &regs) &&
               !MaybeEmulateIoctlSyscall(pid, &state, &regs)) {
+            MaybeRewriteAcceptSyscall(pid, &regs);
             MaybeRewritePingSocket(pid, &regs);
             const ExecRewriteResult exec_rewrite_result =
                 RewriteExecveIfNeeded(pid, normalized_rootfs, &regs);
