@@ -7,6 +7,7 @@
 #include <fcntl.h>
 #include <linux/ptrace.h>
 #include <signal.h>
+#include <stddef.h>
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
@@ -64,6 +65,7 @@ constexpr uint64_t    kSysSetresgid            = 149;
 constexpr uint64_t    kSysGetresgid            = 150;
 constexpr uint64_t    kSysGetgroups            = 158;
 constexpr uint64_t    kSysSetgroups            = 159;
+constexpr uint64_t    kSysPrctl                = 167;
 constexpr uint64_t    kSysGetpid               = 172;
 constexpr uint64_t    kSysGetuid               = 174;
 constexpr uint64_t    kSysGeteuid              = 175;
@@ -583,6 +585,19 @@ bool MaybeEmulateUidGidSyscall(
   }
 }
 
+bool MaybeEmulatePrctlSyscall(
+    pid_t pid, TraceeState* state, user_pt_regs* regs) {
+  if (regs == nullptr || regs->regs[8] != kSysPrctl ||
+      regs->regs[0] != PR_SET_DUMPABLE || regs->regs[1] != 0) {
+    return false;
+  }
+
+  SetEmulatedSyscallReturn(pid, state, regs, 0);
+  __android_log_print(ANDROID_LOG_INFO, kLogTag,
+      "Preserved dumpable state for traced pid=%d", pid);
+  return true;
+}
+
 bool MaybeEmulateIoctlSyscall(
     pid_t pid, TraceeState* state, user_pt_regs* regs) {
   if (regs == nullptr || regs->regs[8] != kSysIoctl) {
@@ -798,21 +813,36 @@ void RewriteSockaddrIfNeeded(
     return;
   }
 
+  const size_t path_offset = offsetof(sockaddr_un, sun_path);
+  if (addrlen <= path_offset) {
+    return;
+  }
+
   char first_byte = 0;
-  if (!ReadTraceeMemory(
-          pid, sockaddr_address + sizeof(sa_family_t), &first_byte, 1)) {
+  if (!ReadTraceeMemory(pid, sockaddr_address + path_offset, &first_byte, 1)) {
     return;
   }
   if (first_byte == '\0') {
     return;
   }
 
-  std::string original_path;
-  if (!ReadTraceeCString(
-          pid, sockaddr_address + sizeof(sa_family_t), 108, &original_path)) {
+  size_t path_size = static_cast<size_t>(addrlen) - path_offset;
+  if (path_size > sizeof(sockaddr_un{}.sun_path)) {
+    path_size = sizeof(sockaddr_un{}.sun_path);
+  }
+  std::vector<char> path_buffer(path_size);
+  if (!ReadTraceeMemory(pid, sockaddr_address + path_offset, path_buffer.data(),
+          path_buffer.size())) {
     return;
   }
 
+  const char* terminator = static_cast<const char*>(
+      memchr(path_buffer.data(), '\0', path_buffer.size()));
+  const size_t original_path_size =
+      terminator == nullptr ?
+          path_buffer.size() :
+          static_cast<size_t>(terminator - path_buffer.data());
+  const std::string original_path(path_buffer.data(), original_path_size);
   if (!IsAbsoluteUnixPath(original_path)) {
     return;
   }
@@ -828,8 +858,8 @@ void RewriteSockaddrIfNeeded(
       static_cast<unsigned long long>(syscall_number), original_path.c_str(),
       rewritten_path.c_str());
 
-  size_t new_addrlen = sizeof(sa_family_t) + rewritten_path.size() + 1;
-  if (new_addrlen > sizeof(sa_family_t) + 108) {
+  const size_t new_addrlen = path_offset + rewritten_path.size() + 1;
+  if (new_addrlen > sizeof(sockaddr_un)) {
     __android_log_print(
         ANDROID_LOG_WARN, kLogTag, "rewritten unix socket path too long");
     return;
@@ -841,11 +871,12 @@ void RewriteSockaddrIfNeeded(
     return;
   }
 
-  if (!WriteTraceeMemory(pid, scratch_address, &family, sizeof(family))) {
-    return;
-  }
-  if (!WriteTraceeMemory(pid, scratch_address + sizeof(family),
-          rewritten_path.c_str(), rewritten_path.size() + 1)) {
+  sockaddr_un rewritten_address{};
+  rewritten_address.sun_family = family;
+  memcpy(rewritten_address.sun_path, rewritten_path.c_str(),
+      rewritten_path.size() + 1);
+  if (!WriteTraceeMemory(
+          pid, scratch_address, &rewritten_address, new_addrlen)) {
     return;
   }
 
@@ -1020,29 +1051,48 @@ int TracerMain(const std::string& extract_dst_path,
     const int      signal_number = WSTOPSIG(wait_status);
     const unsigned event         = static_cast<unsigned>(wait_status) >> 16U;
     if (signal_number == (SIGTRAP | 0x80)) {
-      if (state.has_emulated_return) {
+      bool                is_syscall_entry        = state.expect_entry;
+      bool                syscall_direction_known = false;
+      ptrace_syscall_info syscall_info{};
+      const long          syscall_info_size = ptrace(
+          PTRACE_GET_SYSCALL_INFO, pid, sizeof(syscall_info), &syscall_info);
+      if (syscall_info_size > 0 &&
+          (syscall_info.op == PTRACE_SYSCALL_INFO_ENTRY ||
+              syscall_info.op == PTRACE_SYSCALL_INFO_SECCOMP)) {
+        is_syscall_entry        = true;
+        syscall_direction_known = true;
+      } else if (syscall_info_size > 0 &&
+                 syscall_info.op == PTRACE_SYSCALL_INFO_EXIT) {
+        is_syscall_entry        = false;
+        syscall_direction_known = true;
+      }
+
+      if (state.has_emulated_return && !is_syscall_entry) {
         ApplyEmulatedSyscallReturn(pid, &state);
         state.expect_entry = true;
         ResumeSyscall(pid, 0);
         continue;
       }
 
-      if (state.expect_entry) {
-        user_pt_regs regs{};
-        if (GetRegs(pid, &regs)) {
-          if (!MaybeEmulateUidGidSyscall(pid, &state, &regs) &&
+      user_pt_regs regs{};
+      if (GetRegs(pid, &regs)) {
+        if (is_syscall_entry || !syscall_direction_known) {
+          RewriteSockaddrIfNeeded(pid, normalized_rootfs, &regs);
+        }
+        if (is_syscall_entry) {
+          if (!MaybeEmulatePrctlSyscall(pid, &state, &regs) &&
+              !MaybeEmulateUidGidSyscall(pid, &state, &regs) &&
               !MaybeEmulateIoctlSyscall(pid, &state, &regs)) {
             MaybeRewritePingSocket(pid, &regs);
             const ExecRewriteResult exec_rewrite_result =
                 RewriteExecveIfNeeded(pid, normalized_rootfs, &regs);
             if (exec_rewrite_result == ExecRewriteResult::kNotApplicable) {
               RewritePathArgumentsIfNeeded(pid, normalized_rootfs, &regs);
-              RewriteSockaddrIfNeeded(pid, normalized_rootfs, &regs);
             }
           }
         }
       }
-      state.expect_entry = !state.expect_entry;
+      state.expect_entry = !is_syscall_entry;
       ResumeSyscall(pid, 0);
       continue;
     }
