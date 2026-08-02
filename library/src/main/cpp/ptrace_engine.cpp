@@ -11,9 +11,11 @@
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/file.h>
 #include <sys/prctl.h>
 #include <sys/ptrace.h>
 #include <sys/socket.h>
+#include <sys/stat.h>
 #include <sys/types.h>
 #include <sys/uio.h>
 #include <sys/un.h>
@@ -1100,12 +1102,95 @@ bool SuppressBlockedSyscall(pid_t pid, TraceeState* state) {
   return true;
 }
 
+bool PrepareSharedMemoryDirectory(const std::string& normalized_rootfs) {
+  const std::string dev_path = normalized_rootfs + "/dev";
+  const int         dev_fd =
+      open(dev_path.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW);
+  if (dev_fd < 0) {
+    __android_log_print(ANDROID_LOG_ERROR, kLogTag,
+        "Failed to open rootfs device directory: %s (%s)", dev_path.c_str(),
+        strerror(errno));
+    return false;
+  }
+
+  if (flock(dev_fd, LOCK_EX) != 0) {
+    __android_log_print(ANDROID_LOG_ERROR, kLogTag,
+        "Failed to lock rootfs device directory: %s (%s)", dev_path.c_str(),
+        strerror(errno));
+    close(dev_fd);
+    return false;
+  }
+
+  struct stat dev_stat{};
+  if (fstat(dev_fd, &dev_stat) != 0) {
+    __android_log_print(ANDROID_LOG_ERROR, kLogTag,
+        "Failed to inspect rootfs device directory: %s (%s)", dev_path.c_str(),
+        strerror(errno));
+    close(dev_fd);
+    return false;
+  }
+
+  const mode_t required_dev_mode = S_IWUSR | S_IXUSR;
+  const bool   restore_dev_mode =
+      (dev_stat.st_mode & required_dev_mode) != required_dev_mode;
+  if (restore_dev_mode &&
+      fchmod(dev_fd, dev_stat.st_mode | required_dev_mode) != 0) {
+    __android_log_print(ANDROID_LOG_ERROR, kLogTag,
+        "Failed to make rootfs device directory writable: %s (%s)",
+        dev_path.c_str(), strerror(errno));
+    close(dev_fd);
+    return false;
+  }
+
+  const int mkdir_result = mkdirat(dev_fd, "shm", 01777);
+  const int mkdir_errno  = errno;
+  if (restore_dev_mode && fchmod(dev_fd, dev_stat.st_mode) != 0) {
+    __android_log_print(ANDROID_LOG_ERROR, kLogTag,
+        "Failed to restore rootfs device directory permissions: %s (%s)",
+        dev_path.c_str(), strerror(errno));
+    close(dev_fd);
+    return false;
+  }
+  if (mkdir_result != 0 && mkdir_errno != EEXIST) {
+    __android_log_print(ANDROID_LOG_ERROR, kLogTag,
+        "Failed to create rootfs shared-memory directory: %s/shm (%s)",
+        dev_path.c_str(), strerror(mkdir_errno));
+    close(dev_fd);
+    return false;
+  }
+
+  const int shm_fd =
+      openat(dev_fd, "shm", O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW);
+  if (shm_fd < 0) {
+    __android_log_print(ANDROID_LOG_ERROR, kLogTag,
+        "Failed to open rootfs shared-memory directory: %s/shm (%s)",
+        dev_path.c_str(), strerror(errno));
+    close(dev_fd);
+    return false;
+  }
+  if (fchmod(shm_fd, 01777) != 0) {
+    __android_log_print(ANDROID_LOG_ERROR, kLogTag,
+        "Failed to set rootfs shared-memory permissions: %s/shm (%s)",
+        dev_path.c_str(), strerror(errno));
+    close(shm_fd);
+    close(dev_fd);
+    return false;
+  }
+
+  close(shm_fd);
+  close(dev_fd);
+  return true;
+}
+
 int TracerMain(const std::string& extract_dst_path,
     const std::string&            initial_executable_path,
     const std::function<int()>&   child_spawn_func) {
   prctl(PR_SET_PDEATHSIG, SIGKILL);
 
   const std::string normalized_rootfs = NormalizeRootfsPrefix(extract_dst_path);
+  if (!PrepareSharedMemoryDirectory(normalized_rootfs)) {
+    return 1;
+  }
 
   const pid_t tracee_pid = fork();
   if (tracee_pid < 0) {

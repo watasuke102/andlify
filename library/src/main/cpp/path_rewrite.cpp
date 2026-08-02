@@ -21,6 +21,10 @@ bool IsPassthroughUnixPath(const std::string& path) {
     // Rewriting this directory avoids Permission Denied on ls /dev.
     return false;
   }
+  if (path == "/dev/shm" || path.rfind("/dev/shm/", 0) == 0) {
+    // Android does not provide the POSIX shared-memory directory to apps.
+    return false;
+  }
   return path.rfind("/dev/", 0) == 0 || path == "/proc" ||
          path.rfind("/proc/", 0) == 0 || path == "/sys" ||
          path.rfind("/sys/", 0) == 0;
