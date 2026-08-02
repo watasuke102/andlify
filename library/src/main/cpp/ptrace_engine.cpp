@@ -20,6 +20,7 @@
 #include <sys/wait.h>
 #include <unistd.h>
 
+#include <algorithm>
 #include <string>
 #include <unordered_map>
 #include <unordered_set>
@@ -110,10 +111,12 @@ constexpr const char* kDefaultEnvironment[][2] = {
 };
 
 struct TraceeState {
-  bool     expect_entry        = true;
-  bool     options_applied     = false;
-  bool     has_emulated_return = false;
-  uint64_t emulated_return     = 0;
+  bool        expect_entry        = true;
+  bool        options_applied     = false;
+  bool        has_emulated_return = false;
+  uint64_t    emulated_return     = 0;
+  std::string executable_path;
+  std::string pending_executable_path;
 };
 
 struct ExecPlan {
@@ -370,8 +373,9 @@ bool ReadTraceeArgv(
   return false;
 }
 
-ExecRewriteResult RewriteExecveIfNeeded(
-    pid_t pid, const std::string& normalized_rootfs, user_pt_regs* regs) {
+ExecRewriteResult RewriteExecveIfNeeded(pid_t pid,
+    const std::string& normalized_rootfs, user_pt_regs* regs,
+    std::string* virtual_executable_path) {
   if (regs == nullptr || regs->regs[8] != kSysExecve) {
     return ExecRewriteResult::kNotApplicable;
   }
@@ -498,6 +502,17 @@ ExecRewriteResult RewriteExecveIfNeeded(
     return ExecRewriteResult::kFailed;
   }
 
+  if (virtual_executable_path != nullptr) {
+    if (rewritten_path == normalized_rootfs) {
+      *virtual_executable_path = "/";
+    } else if (rewritten_path.rfind(normalized_rootfs + "/", 0) == 0) {
+      *virtual_executable_path =
+          rewritten_path.substr(normalized_rootfs.size());
+    } else {
+      *virtual_executable_path = original_path;
+    }
+  }
+
   __android_log_print(ANDROID_LOG_INFO, kLogTag,
       "Rewrote execve to interpreter pid=%d command=%s interpreter=%s", pid,
       rewritten_path.c_str(), executable_path.c_str());
@@ -539,6 +554,43 @@ void SetEmulatedSyscallReturn(
 
   state->has_emulated_return = true;
   state->emulated_return     = static_cast<uint64_t>(return_value);
+}
+
+bool MaybeEmulateProcSelfExeReadlink(
+    pid_t pid, TraceeState* state, user_pt_regs* regs) {
+  if (state == nullptr || regs == nullptr || regs->regs[8] != kSysReadlinkat ||
+      state->executable_path.empty()) {
+    return false;
+  }
+
+  std::string path;
+  if (!ReadTraceeCString(pid, regs->regs[1], kPathReadLimit, &path)) {
+    return false;
+  }
+
+  char process_exe_path[64];
+  snprintf(process_exe_path, sizeof(process_exe_path), "/proc/%d/exe", pid);
+  if (path != "/proc/self/exe" && path != "/proc/thread-self/exe" &&
+      path != process_exe_path) {
+    return false;
+  }
+
+  const uint64_t buffer_address = regs->regs[2];
+  const size_t   buffer_size    = static_cast<size_t>(regs->regs[3]);
+  if (buffer_size == 0) {
+    SetEmulatedSyscallReturn(pid, state, regs, -EINVAL);
+    return true;
+  }
+
+  const size_t result_size =
+      std::min(buffer_size, state->executable_path.size());
+  if (buffer_address == 0 || !WriteTraceeMemory(pid, buffer_address,
+                                 state->executable_path.data(), result_size)) {
+    return false;
+  }
+
+  SetEmulatedSyscallReturn(pid, state, regs, result_size);
+  return true;
 }
 
 void MaybeRewriteAcceptSyscall(pid_t pid, user_pt_regs* regs) {
@@ -1049,6 +1101,7 @@ bool SuppressBlockedSyscall(pid_t pid, TraceeState* state) {
 }
 
 int TracerMain(const std::string& extract_dst_path,
+    const std::string&            initial_executable_path,
     const std::function<int()>&   child_spawn_func) {
   prctl(PR_SET_PDEATHSIG, SIGKILL);
 
@@ -1070,7 +1123,9 @@ int TracerMain(const std::string& extract_dst_path,
   std::unordered_map<pid_t, TraceeState> states;
   std::unordered_set<pid_t>              tracked_pids;
 
-  states.emplace(tracee_pid, TraceeState{});
+  TraceeState initial_state;
+  initial_state.executable_path = initial_executable_path;
+  states.emplace(tracee_pid, std::move(initial_state));
   tracked_pids.emplace(tracee_pid);
   if (!ApplyTraceOptions(tracee_pid)) {
     return 1;
@@ -1143,13 +1198,14 @@ int TracerMain(const std::string& extract_dst_path,
           RewriteSockaddrIfNeeded(pid, normalized_rootfs, &regs);
         }
         if (is_syscall_entry) {
-          if (!MaybeEmulatePrctlSyscall(pid, &state, &regs) &&
+          if (!MaybeEmulateProcSelfExeReadlink(pid, &state, &regs) &&
+              !MaybeEmulatePrctlSyscall(pid, &state, &regs) &&
               !MaybeEmulateUidGidSyscall(pid, &state, &regs) &&
               !MaybeHandleIoctlSyscall(pid, &state, &regs)) {
             MaybeRewriteAcceptSyscall(pid, &regs);
             MaybeRewritePingSocket(pid, &regs);
-            const ExecRewriteResult exec_rewrite_result =
-                RewriteExecveIfNeeded(pid, normalized_rootfs, &regs);
+            const ExecRewriteResult exec_rewrite_result = RewriteExecveIfNeeded(
+                pid, normalized_rootfs, &regs, &state.pending_executable_path);
             if (exec_rewrite_result == ExecRewriteResult::kNotApplicable) {
               RewritePathArgumentsIfNeeded(pid, normalized_rootfs, &regs);
             }
@@ -1170,8 +1226,14 @@ int TracerMain(const std::string& extract_dst_path,
         if (ptrace(PTRACE_GETEVENTMSG, pid, nullptr, &new_pid) == 0 &&
             new_pid > 0) {
           tracked_pids.insert(static_cast<pid_t>(new_pid));
-          states.emplace(static_cast<pid_t>(new_pid), TraceeState{});
+          TraceeState child_state;
+          child_state.executable_path = state.executable_path;
+          states.emplace(static_cast<pid_t>(new_pid), std::move(child_state));
         }
+      } else if (event == PTRACE_EVENT_EXEC &&
+                 !state.pending_executable_path.empty()) {
+        state.executable_path = std::move(state.pending_executable_path);
+        state.pending_executable_path.clear();
       }
       ResumeSyscall(pid, 0);
       continue;
@@ -1222,7 +1284,8 @@ int StartChroot(const std::string& extract_dst_path,
   }
 
   if (tracer_pid == 0) {
-    _exit(TracerMain(extract_dst_path, child_spawn_func));
+    _exit(
+        TracerMain(extract_dst_path, command_path_in_rootfs, child_spawn_func));
   }
 
   return tracer_pid;
@@ -1271,7 +1334,7 @@ int StartChrootFunc(const std::string& extract_dst_path,
   }
 
   if (tracer_pid == 0) {
-    _exit(TracerMain(extract_dst_path, child_spawn_func));
+    _exit(TracerMain(extract_dst_path, "", child_spawn_func));
   }
 
   return tracer_pid;
