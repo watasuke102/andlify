@@ -112,6 +112,8 @@ constexpr const char* kDefaultEnvironment[][2] = {
     {"TMPDIR",  "/tmp"                         },
 };
 
+constexpr char kInotifyMaxUserWatchesValue[] = "8192\n";
+
 struct TraceeState {
   bool        expect_entry        = true;
   bool        options_applied     = false;
@@ -1182,6 +1184,61 @@ bool PrepareSharedMemoryDirectory(const std::string& normalized_rootfs) {
   return true;
 }
 
+bool PrepareInotifyMaxUserWatchesFile(const std::string& normalized_rootfs) {
+  const std::string backing_path =
+      normalized_rootfs + kInotifyMaxUserWatchesBackingPath;
+  const std::string temporary_template = backing_path + ".XXXXXX";
+  std::vector<char> temporary_path_buffer(
+      temporary_template.begin(), temporary_template.end());
+  temporary_path_buffer.push_back('\0');
+
+  const int fd = mkostemp(temporary_path_buffer.data(), O_CLOEXEC);
+  if (fd < 0) {
+    __android_log_print(ANDROID_LOG_ERROR, kLogTag,
+        "Failed to create temporary inotify limit file: %s (%s)",
+        temporary_template.c_str(), strerror(errno));
+    return false;
+  }
+  const std::string temporary_path(temporary_path_buffer.data());
+
+  size_t written = 0;
+  while (written < sizeof(kInotifyMaxUserWatchesValue) - 1) {
+    const ssize_t result = write(fd, kInotifyMaxUserWatchesValue + written,
+        sizeof(kInotifyMaxUserWatchesValue) - 1 - written);
+    if (result < 0 && errno == EINTR) {
+      continue;
+    }
+    if (result <= 0) {
+      __android_log_print(ANDROID_LOG_ERROR, kLogTag,
+          "Failed to write inotify limit file: %s (%s)", temporary_path.c_str(),
+          strerror(errno));
+      close(fd);
+      unlink(temporary_path.c_str());
+      return false;
+    }
+    written += static_cast<size_t>(result);
+  }
+
+  if (fchmod(fd, 0444) != 0) {
+    __android_log_print(ANDROID_LOG_ERROR, kLogTag,
+        "Failed to set inotify limit file permissions: %s (%s)",
+        temporary_path.c_str(), strerror(errno));
+    close(fd);
+    unlink(temporary_path.c_str());
+    return false;
+  }
+  close(fd);
+
+  if (rename(temporary_path.c_str(), backing_path.c_str()) != 0) {
+    __android_log_print(ANDROID_LOG_ERROR, kLogTag,
+        "Failed to publish inotify limit file: %s (%s)", backing_path.c_str(),
+        strerror(errno));
+    unlink(temporary_path.c_str());
+    return false;
+  }
+  return true;
+}
+
 int TracerMain(const std::string& extract_dst_path,
     const std::string&            initial_executable_path,
     const std::function<int()>&   child_spawn_func) {
@@ -1189,6 +1246,9 @@ int TracerMain(const std::string& extract_dst_path,
 
   const std::string normalized_rootfs = NormalizeRootfsPrefix(extract_dst_path);
   if (!PrepareSharedMemoryDirectory(normalized_rootfs)) {
+    return 1;
+  }
+  if (!PrepareInotifyMaxUserWatchesFile(normalized_rootfs)) {
     return 1;
   }
 

@@ -2,6 +2,11 @@
 
 #include <string>
 
+inline constexpr char kInotifyMaxUserWatchesPath[] =
+    "/proc/sys/fs/inotify/max_user_watches";
+inline constexpr char kInotifyMaxUserWatchesBackingPath[] =
+    "/tmp/.andlify-inotify-max-user-watches";
+
 std::string NormalizeRootfsPrefix(const std::string& rootfs_path);
 bool        IsAbsoluteUnixPath(const std::string& path);
 bool        IsPassthroughUnixPath(const std::string& path);

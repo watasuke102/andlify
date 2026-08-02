@@ -44,6 +44,10 @@ std::string RewritePathToRootfs(
     return normalized_rootfs;
   }
 
+  if (original_path == kInotifyMaxUserWatchesPath) {
+    return normalized_rootfs + kInotifyMaxUserWatchesBackingPath;
+  }
+
   if (original_path.rfind(normalized_rootfs, 0) == 0) {
     return original_path;
   }
