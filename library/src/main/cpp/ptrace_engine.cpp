@@ -128,6 +128,25 @@ struct ExecPlan {
   std::vector<std::string> args;
 };
 
+std::string ResolveVirtualExecutablePath(const std::string& normalized_rootfs,
+    const std::string& real_executable_path,
+    const std::string& fallback_virtual_path) {
+  char* resolved_path = realpath(real_executable_path.c_str(), nullptr);
+  const std::string canonical_path =
+      resolved_path == nullptr ? real_executable_path : resolved_path;
+  free(resolved_path);
+
+  if (canonical_path == normalized_rootfs) {
+    return "/";
+  }
+
+  const std::string rootfs_prefix = normalized_rootfs + "/";
+  if (canonical_path.rfind(rootfs_prefix, 0) == 0) {
+    return canonical_path.substr(normalized_rootfs.size());
+  }
+  return fallback_virtual_path;
+}
+
 bool ResetEnvironment() {
   if (clearenv() != 0) {
     return false;
@@ -507,14 +526,8 @@ ExecRewriteResult RewriteExecveIfNeeded(pid_t pid,
   }
 
   if (virtual_executable_path != nullptr) {
-    if (rewritten_path == normalized_rootfs) {
-      *virtual_executable_path = "/";
-    } else if (rewritten_path.rfind(normalized_rootfs + "/", 0) == 0) {
-      *virtual_executable_path =
-          rewritten_path.substr(normalized_rootfs.size());
-    } else {
-      *virtual_executable_path = original_path;
-    }
+    *virtual_executable_path = ResolveVirtualExecutablePath(
+        normalized_rootfs, rewritten_path, original_path);
   }
 
   __android_log_print(ANDROID_LOG_INFO, kLogTag,
@@ -1269,7 +1282,12 @@ int TracerMain(const std::string& extract_dst_path,
   std::unordered_set<pid_t>              tracked_pids;
 
   TraceeState initial_state;
-  initial_state.executable_path = initial_executable_path;
+  if (!initial_executable_path.empty()) {
+    initial_state.executable_path =
+        ResolveVirtualExecutablePath(normalized_rootfs,
+            BuildRealPathInRootfs(normalized_rootfs, initial_executable_path),
+            initial_executable_path);
+  }
   states.emplace(tracee_pid, std::move(initial_state));
   tracked_pids.emplace(tracee_pid);
   if (!ApplyTraceOptions(tracee_pid)) {
