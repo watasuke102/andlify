@@ -398,7 +398,8 @@ bool ReadTraceeArgv(
 
 ExecRewriteResult RewriteExecveIfNeeded(pid_t pid,
     const std::string& normalized_rootfs, user_pt_regs* regs,
-    std::string* virtual_executable_path) {
+    const std::string& current_executable_path,
+    std::string*       virtual_executable_path) {
   if (regs == nullptr || regs->regs[8] != kSysExecve) {
     return ExecRewriteResult::kNotApplicable;
   }
@@ -416,9 +417,20 @@ ExecRewriteResult RewriteExecveIfNeeded(pid_t pid,
     return ExecRewriteResult::kNotApplicable;
   }
 
+  char process_exe_path[64];
+  snprintf(process_exe_path, sizeof(process_exe_path), "/proc/%d/exe", pid);
+  const bool is_current_executable = original_path == "/proc/self/exe" ||
+                                     original_path == "/proc/thread-self/exe" ||
+                                     original_path == process_exe_path;
+
+  std::string virtual_path = original_path;
+  if (is_current_executable && !current_executable_path.empty()) {
+    virtual_path = current_executable_path;
+  }
+
   std::string rewritten_path;
-  if (IsAbsoluteUnixPath(original_path)) {
-    rewritten_path = RewritePathToRootfs(normalized_rootfs, original_path);
+  if (IsAbsoluteUnixPath(virtual_path)) {
+    rewritten_path = RewritePathToRootfs(normalized_rootfs, virtual_path);
   } else {
     char process_cwd_path[64];
     snprintf(process_cwd_path, sizeof(process_cwd_path), "/proc/%d/cwd", pid);
@@ -432,7 +444,7 @@ ExecRewriteResult RewriteExecveIfNeeded(pid_t pid,
     if (rewritten_path.back() != '/') {
       rewritten_path.push_back('/');
     }
-    rewritten_path.append(original_path);
+    rewritten_path.append(virtual_path);
   }
   std::string              interpreter_path;
   std::string              interpreter_argument;
@@ -527,7 +539,7 @@ ExecRewriteResult RewriteExecveIfNeeded(pid_t pid,
 
   if (virtual_executable_path != nullptr) {
     *virtual_executable_path = ResolveVirtualExecutablePath(
-        normalized_rootfs, rewritten_path, original_path);
+        normalized_rootfs, rewritten_path, virtual_path);
   }
 
   __android_log_print(ANDROID_LOG_INFO, kLogTag,
@@ -1367,8 +1379,9 @@ int TracerMain(const std::string& extract_dst_path,
               !MaybeHandleIoctlSyscall(pid, &state, &regs)) {
             MaybeRewriteAcceptSyscall(pid, &regs);
             MaybeRewritePingSocket(pid, &regs);
-            const ExecRewriteResult exec_rewrite_result = RewriteExecveIfNeeded(
-                pid, normalized_rootfs, &regs, &state.pending_executable_path);
+            const ExecRewriteResult exec_rewrite_result =
+                RewriteExecveIfNeeded(pid, normalized_rootfs, &regs,
+                    state.executable_path, &state.pending_executable_path);
             if (exec_rewrite_result == ExecRewriteResult::kNotApplicable) {
               RewritePathArgumentsIfNeeded(pid, normalized_rootfs, &regs);
             }
