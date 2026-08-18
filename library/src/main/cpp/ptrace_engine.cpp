@@ -5,6 +5,7 @@
 #include <elf.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <limits.h>
 #include <linux/ptrace.h>
 #include <signal.h>
 #include <stddef.h>
@@ -194,6 +195,78 @@ bool SetRegs(pid_t pid, const user_pt_regs& regs) {
   iovec io{const_cast<user_pt_regs*>(&regs), sizeof(regs)};
   return ptrace(PTRACE_SETREGSET, pid, reinterpret_cast<void*>(NT_PRSTATUS),
              &io) == 0;
+}
+
+bool ResolveVirtualPathBase(pid_t pid, int dir_fd,
+    const std::string& normalized_rootfs, std::string* virtual_path) {
+  if (virtual_path == nullptr) {
+    return false;
+  }
+
+  char source_path[64];
+  if (dir_fd == AT_FDCWD) {
+    snprintf(source_path, sizeof(source_path), "/proc/%d/cwd", pid);
+  } else {
+    snprintf(source_path, sizeof(source_path), "/proc/%d/fd/%d", pid, dir_fd);
+  }
+
+  char          resolved_path[kPathReadLimit];
+  const ssize_t resolved_size =
+      readlink(source_path, resolved_path, sizeof(resolved_path) - 1);
+  if (resolved_size <= 0) {
+    return false;
+  }
+  resolved_path[resolved_size] = '\0';
+
+  const std::string real_path(resolved_path);
+  if (real_path == normalized_rootfs) {
+    *virtual_path = "/";
+    return true;
+  }
+
+  const std::string rootfs_prefix = normalized_rootfs + "/";
+  if (real_path.rfind(rootfs_prefix, 0) == 0) {
+    *virtual_path = real_path.substr(normalized_rootfs.size());
+    return true;
+  }
+  if (IsPassthroughUnixPath(real_path)) {
+    *virtual_path = real_path;
+    return true;
+  }
+  return false;
+}
+
+std::string ResolveVirtualRelativePath(
+    const std::string& base_path, const std::string& relative_path) {
+  std::vector<std::string> components;
+  const std::string        combined_path = base_path + "/" + relative_path;
+  size_t                   start         = 0;
+  while (start <= combined_path.size()) {
+    const size_t slash = combined_path.find('/', start);
+    const size_t end =
+        slash == std::string::npos ? combined_path.size() : slash;
+    const std::string component = combined_path.substr(start, end - start);
+    if (component == "..") {
+      if (!components.empty()) {
+        components.pop_back();
+      }
+    } else if (!component.empty() && component != ".") {
+      components.push_back(component);
+    }
+    if (slash == std::string::npos) {
+      break;
+    }
+    start = slash + 1;
+  }
+
+  std::string result = "/";
+  for (size_t i = 0; i < components.size(); ++i) {
+    if (i != 0) {
+      result.push_back('/');
+    }
+    result.append(components[i]);
+  }
+  return result;
 }
 
 bool ApplyTraceOptions(pid_t pid) {
@@ -603,23 +676,73 @@ void SetEmulatedSyscallReturn(
   state->emulated_return     = static_cast<uint64_t>(return_value);
 }
 
-bool MaybeEmulateProcSelfExeReadlink(
-    pid_t pid, TraceeState* state, user_pt_regs* regs) {
-  if (state == nullptr || regs == nullptr || regs->regs[8] != kSysReadlinkat ||
-      state->executable_path.empty()) {
+bool MaybeEmulateProcSelfReadlink(pid_t pid,
+    const std::string& normalized_rootfs, TraceeState* state,
+    user_pt_regs* regs) {
+  if (state == nullptr || regs == nullptr || regs->regs[8] != kSysReadlinkat) {
     return false;
   }
 
   std::string path;
-  if (!ReadTraceeCString(pid, regs->regs[1], kPathReadLimit, &path)) {
+  if (!ReadTraceeCString(pid, regs->regs[1], kPathReadLimit, &path) ||
+      path.empty()) {
     return false;
+  }
+  if (!IsAbsoluteUnixPath(path)) {
+    std::string base_path;
+    if (!ResolveVirtualPathBase(pid, static_cast<int>(regs->regs[0]),
+            normalized_rootfs, &base_path)) {
+      return false;
+    }
+    path = ResolveVirtualRelativePath(base_path, path);
   }
 
   char process_exe_path[64];
   snprintf(process_exe_path, sizeof(process_exe_path), "/proc/%d/exe", pid);
-  if (path != "/proc/self/exe" && path != "/proc/thread-self/exe" &&
-      path != process_exe_path) {
-    return false;
+  char process_cwd_path[64];
+  snprintf(process_cwd_path, sizeof(process_cwd_path), "/proc/%d/cwd", pid);
+  char process_root_path[64];
+  snprintf(process_root_path, sizeof(process_root_path), "/proc/%d/root", pid);
+  char process_fd_prefix[64];
+  snprintf(process_fd_prefix, sizeof(process_fd_prefix), "/proc/%d/fd/", pid);
+
+  std::string result;
+  if (path == "/proc/self/exe" || path == "/proc/thread-self/exe" ||
+      path == process_exe_path) {
+    if (state->executable_path.empty()) {
+      return false;
+    }
+    result = state->executable_path;
+  } else if (path == "/proc/self/cwd" || path == "/proc/thread-self/cwd" ||
+             path == process_cwd_path) {
+    if (!ResolveVirtualPathBase(pid, AT_FDCWD, normalized_rootfs, &result)) {
+      return false;
+    }
+  } else if (path == "/proc/self/root" || path == "/proc/thread-self/root" ||
+             path == process_root_path) {
+    result = "/";
+  } else {
+    const std::string self_fd_prefix   = "/proc/self/fd/";
+    const std::string thread_fd_prefix = "/proc/thread-self/fd/";
+    std::string       fd_text;
+    if (path.rfind(self_fd_prefix, 0) == 0) {
+      fd_text = path.substr(self_fd_prefix.size());
+    } else if (path.rfind(thread_fd_prefix, 0) == 0) {
+      fd_text = path.substr(thread_fd_prefix.size());
+    } else if (path.rfind(process_fd_prefix, 0) == 0) {
+      fd_text = path.substr(strlen(process_fd_prefix));
+    } else {
+      return false;
+    }
+
+    char*      end     = nullptr;
+    const long file_fd = strtol(fd_text.c_str(), &end, 10);
+    if (fd_text.empty() || end == nullptr || *end != '\0' || file_fd < 0 ||
+        file_fd > INT_MAX ||
+        !ResolveVirtualPathBase(
+            pid, static_cast<int>(file_fd), normalized_rootfs, &result)) {
+      return false;
+    }
   }
 
   const uint64_t buffer_address = regs->regs[2];
@@ -629,10 +752,9 @@ bool MaybeEmulateProcSelfExeReadlink(
     return true;
   }
 
-  const size_t result_size =
-      std::min(buffer_size, state->executable_path.size());
-  if (buffer_address == 0 || !WriteTraceeMemory(pid, buffer_address,
-                                 state->executable_path.data(), result_size)) {
+  const size_t result_size = std::min(buffer_size, result.size());
+  if (buffer_address == 0 ||
+      !WriteTraceeMemory(pid, buffer_address, result.data(), result_size)) {
     return false;
   }
 
@@ -1177,7 +1299,8 @@ bool ApplyEmulatedSyscallReturn(pid_t pid, TraceeState* state) {
 }
 
 void RewritePathArgument(pid_t pid, const std::string& normalized_rootfs,
-    user_pt_regs* regs, int arg_index, uint64_t scratch_offset) {
+    user_pt_regs* regs, int arg_index, int dir_fd_arg_index,
+    uint64_t scratch_offset) {
   const uint64_t source_path_address = regs->regs[arg_index];
   if (source_path_address == 0) {
     return;
@@ -1185,15 +1308,24 @@ void RewritePathArgument(pid_t pid, const std::string& normalized_rootfs,
 
   std::string original_path;
   if (!ReadTraceeCString(
-          pid, source_path_address, kPathReadLimit, &original_path)) {
+          pid, source_path_address, kPathReadLimit, &original_path) ||
+      original_path.empty()) {
     return;
   }
-  if (!IsAbsoluteUnixPath(original_path)) {
-    return;
+  std::string virtual_path = original_path;
+  if (!IsAbsoluteUnixPath(virtual_path)) {
+    const int   dir_fd = dir_fd_arg_index < 0 ?
+                             AT_FDCWD :
+                             static_cast<int>(regs->regs[dir_fd_arg_index]);
+    std::string base_path;
+    if (!ResolveVirtualPathBase(pid, dir_fd, normalized_rootfs, &base_path)) {
+      return;
+    }
+    virtual_path = ResolveVirtualRelativePath(base_path, virtual_path);
   }
 
   const std::string rewritten_path =
-      RewritePathToRootfs(normalized_rootfs, original_path);
+      RewritePathToRootfs(normalized_rootfs, virtual_path);
   if (rewritten_path == original_path) {
     return;
   }
@@ -1230,7 +1362,8 @@ void RewritePathArgumentsIfNeeded(
     case kSysChdir:
     case kSysExecve:
     case kSysStatfs:
-      RewritePathArgument(pid, normalized_rootfs, regs, 0, kStackScratchOffset);
+      RewritePathArgument(
+          pid, normalized_rootfs, regs, 0, -1, kStackScratchOffset);
       return;
     case kSysMknodat:
     case kSysMkdirat:
@@ -1245,17 +1378,20 @@ void RewritePathArgumentsIfNeeded(
     case kSysStatx:
     case kSysOpenat2:
     case kSysFaccessat2:
-      RewritePathArgument(pid, normalized_rootfs, regs, 1, kStackScratchOffset);
+      RewritePathArgument(
+          pid, normalized_rootfs, regs, 1, 0, kStackScratchOffset);
       return;
     case kSysSymlinkat:
-      RewritePathArgument(pid, normalized_rootfs, regs, 2, kStackScratchOffset);
+      RewritePathArgument(
+          pid, normalized_rootfs, regs, 2, 1, kStackScratchOffset);
       return;
     case kSysLinkat:
     case kSysRenameat:
     case kSysRenameat2:
-      RewritePathArgument(pid, normalized_rootfs, regs, 1, kStackScratchOffset);
       RewritePathArgument(
-          pid, normalized_rootfs, regs, 3, kStackScratchOffset * 2);
+          pid, normalized_rootfs, regs, 1, 0, kStackScratchOffset);
+      RewritePathArgument(
+          pid, normalized_rootfs, regs, 3, 2, kStackScratchOffset * 2);
       return;
     default:
       return;
@@ -1710,7 +1846,8 @@ int TracerMain(const std::string& extract_dst_path,
           RewriteSockaddrIfNeeded(pid, normalized_rootfs, &regs);
         }
         if (is_syscall_entry) {
-          if (!MaybeEmulateProcSelfExeReadlink(pid, &state, &regs) &&
+          if (!MaybeEmulateProcSelfReadlink(
+                  pid, normalized_rootfs, &state, &regs) &&
               !MaybeEmulatePrctlSyscall(pid, &state, &regs) &&
               !MaybeEmulateUidGidSyscall(pid, &state, &regs) &&
               !MaybeEmulateUnavailableAuditSocket(pid, &state, &regs) &&
