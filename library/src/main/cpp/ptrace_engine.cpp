@@ -24,7 +24,9 @@
 #include <unistd.h>
 
 #include <algorithm>
+#include <deque>
 #include <string>
+#include <string_view>
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
@@ -97,6 +99,7 @@ constexpr size_t      kPathReadLimit           = 4096;
 constexpr uint64_t    kStackScratchOffset      = 0x800;
 constexpr uint64_t    kExecScratchSize         = 0x2000;
 constexpr size_t      kMaxExecArgCount         = 64;
+constexpr size_t      kMaxSymlinkDepth         = 40;
 constexpr uint64_t    kRootUid                 = 0;
 constexpr uint64_t    kRootGid                 = 0;
 constexpr uint64_t    kAfUnix                  = 1;
@@ -269,6 +272,139 @@ std::string ResolveVirtualRelativePath(
   return result;
 }
 
+std::string ResolveVirtualSymlinks(const std::string& normalized_rootfs,
+    const std::string& path, bool follow_final_symlink) {
+  bool requires_directory = path.size() > 1 && path.back() == '/';
+  std::deque<std::string> pending_components;
+  size_t                  start = 0;
+  while (start <= path.size()) {
+    const size_t slash = path.find('/', start);
+    const size_t end   = slash == std::string::npos ? path.size() : slash;
+    if (end != start) {
+      pending_components.emplace_back(path.substr(start, end - start));
+    }
+    if (slash == std::string::npos) {
+      break;
+    }
+    start = slash + 1;
+  }
+
+  std::vector<std::string> resolved_components;
+  size_t                   symlink_depth = 0;
+  while (!pending_components.empty()) {
+    std::string component = std::move(pending_components.front());
+    pending_components.pop_front();
+    if (component == ".") {
+      continue;
+    }
+    if (component == "..") {
+      if (!resolved_components.empty()) {
+        resolved_components.pop_back();
+      }
+      continue;
+    }
+
+    std::string candidate_path;
+    for (const std::string& resolved_component : resolved_components) {
+      candidate_path.push_back('/');
+      candidate_path.append(resolved_component);
+    }
+    candidate_path.push_back('/');
+    candidate_path.append(component);
+
+    if (pending_components.empty() && !follow_final_symlink &&
+        !requires_directory) {
+      resolved_components.emplace_back(std::move(component));
+      continue;
+    }
+
+    const std::string real_path =
+        RewritePathToRootfs(normalized_rootfs, candidate_path);
+    char          target[kPathReadLimit];
+    const ssize_t target_size =
+        readlink(real_path.c_str(), target, sizeof(target) - 1);
+    if (target_size < 0) {
+      resolved_components.emplace_back(std::move(component));
+      continue;
+    }
+    if (++symlink_depth > kMaxSymlinkDepth) {
+      return path;
+    }
+    target[target_size] = '\0';
+    if (target_size > 0 && target[target_size - 1] == '/') {
+      requires_directory = true;
+    }
+    if (IsAbsoluteUnixPath(target)) {
+      resolved_components.clear();
+    }
+
+    std::vector<std::string> target_components;
+    start = 0;
+    while (start <= static_cast<size_t>(target_size)) {
+      const size_t slash =
+          std::string_view(target, target_size).find('/', start);
+      const size_t end = slash == std::string::npos ? target_size : slash;
+      if (end != start) {
+        target_components.emplace_back(target + start, end - start);
+      }
+      if (slash == std::string::npos) {
+        break;
+      }
+      start = slash + 1;
+    }
+    for (auto it = target_components.rbegin(); it != target_components.rend();
+        ++it) {
+      pending_components.emplace_front(std::move(*it));
+    }
+  }
+
+  if (resolved_components.empty()) {
+    return "/";
+  }
+  std::string result;
+  for (const std::string& component : resolved_components) {
+    result.push_back('/');
+    result.append(component);
+  }
+  if (requires_directory) {
+    result.push_back('/');
+  }
+  return result;
+}
+
+bool ShouldFollowFinalSymlink(
+    pid_t pid, const user_pt_regs& regs, int arg_index) {
+  switch (regs.regs[8]) {
+    case kSysMknodat:
+    case kSysMkdirat:
+    case kSysUnlinkat:
+    case kSysReadlinkat:
+    case kSysSymlinkat:
+    case kSysRenameat:
+    case kSysRenameat2:
+      return false;
+    case kSysOpenat:
+      return (regs.regs[2] & O_NOFOLLOW) == 0;
+    case kSysOpenat2: {
+      uint64_t flags = 0;
+      return !ReadTraceeMemory(pid, regs.regs[2], &flags, sizeof(flags)) ||
+             (flags & O_NOFOLLOW) == 0;
+    }
+    case kSysNewfstatat:
+    case kSysUtimensat:
+    case kSysFaccessat2:
+      return (regs.regs[3] & AT_SYMLINK_NOFOLLOW) == 0;
+    case kSysFchownat:
+      return (regs.regs[4] & AT_SYMLINK_NOFOLLOW) == 0;
+    case kSysStatx:
+      return (regs.regs[2] & AT_SYMLINK_NOFOLLOW) == 0;
+    case kSysLinkat:
+      return arg_index == 1 && (regs.regs[4] & AT_SYMLINK_FOLLOW) != 0;
+    default:
+      return true;
+  }
+}
+
 bool ApplyTraceOptions(pid_t pid) {
   const long options = PTRACE_O_TRACESYSGOOD | PTRACE_O_TRACEFORK |
                        PTRACE_O_TRACEVFORK | PTRACE_O_TRACECLONE |
@@ -414,8 +550,13 @@ bool ReadShebangInterpreter(const std::string& executable_path,
 
 ExecPlan BuildExecPlan(const std::string& extract_dst_path,
     const std::string&                    command_path_in_rootfs) {
+  const std::string normalized_rootfs = NormalizeRootfsPrefix(extract_dst_path);
+  const std::string virtual_exec_path =
+      ResolveVirtualSymlinks(normalized_rootfs,
+          command_path_in_rootfs.empty() ? "/bin/sh" : command_path_in_rootfs,
+          true);
   const std::string real_exec_path =
-      BuildRealPathInRootfs(extract_dst_path, command_path_in_rootfs);
+      RewritePathToRootfs(normalized_rootfs, virtual_exec_path);
   ExecPlan plan{real_exec_path,
       {command_path_in_rootfs.empty() ? std::string("/bin/sh") :
                                         command_path_in_rootfs}};
@@ -426,7 +567,8 @@ ExecPlan BuildExecPlan(const std::string& extract_dst_path,
   std::string interpreter_path;
   if (ReadElfInterpreter(real_exec_path, &interpreter_path)) {
     const std::string real_interpreter_path =
-        BuildRealPathInRootfs(extract_dst_path, interpreter_path);
+        RewritePathToRootfs(normalized_rootfs,
+            ResolveVirtualSymlinks(normalized_rootfs, interpreter_path, true));
     if (real_interpreter_path.empty()) {
       return plan;
     }
@@ -446,7 +588,8 @@ ExecPlan BuildExecPlan(const std::string& extract_dst_path,
   }
 
   const std::string real_script_interpreter =
-      BuildRealPathInRootfs(extract_dst_path, interpreter_path);
+      RewritePathToRootfs(normalized_rootfs,
+          ResolveVirtualSymlinks(normalized_rootfs, interpreter_path, true));
   if (real_script_interpreter.empty()) {
     return plan;
   }
@@ -455,9 +598,9 @@ ExecPlan BuildExecPlan(const std::string& extract_dst_path,
   plan.args            = {interpreter_path};
   std::string elf_interpreter;
   if (ReadElfInterpreter(real_script_interpreter, &elf_interpreter)) {
-    plan.executable_path =
-        BuildRealPathInRootfs(extract_dst_path, elf_interpreter);
-    plan.args = {elf_interpreter, real_script_interpreter};
+    plan.executable_path = RewritePathToRootfs(normalized_rootfs,
+        ResolveVirtualSymlinks(normalized_rootfs, elf_interpreter, true));
+    plan.args            = {elf_interpreter, real_script_interpreter};
   }
   if (!interpreter_argument.empty()) {
     plan.args.push_back(interpreter_argument);
@@ -519,43 +662,39 @@ ExecRewriteResult RewriteExecveIfNeeded(pid_t pid,
     virtual_path = current_executable_path;
   }
 
-  std::string rewritten_path;
-  if (IsAbsoluteUnixPath(virtual_path)) {
-    rewritten_path = RewritePathToRootfs(normalized_rootfs, virtual_path);
-  } else {
-    char process_cwd_path[64];
-    snprintf(process_cwd_path, sizeof(process_cwd_path), "/proc/%d/cwd", pid);
-    char          cwd[kPathReadLimit];
-    const ssize_t cwd_size = readlink(process_cwd_path, cwd, sizeof(cwd) - 1);
-    if (cwd_size <= 0) {
+  if (!IsAbsoluteUnixPath(virtual_path)) {
+    std::string base_path;
+    if (!ResolveVirtualPathBase(pid, AT_FDCWD, normalized_rootfs, &base_path)) {
       return ExecRewriteResult::kNotApplicable;
     }
-    cwd[cwd_size] = '\0';
-    rewritten_path.assign(cwd);
-    if (rewritten_path.back() != '/') {
-      rewritten_path.push_back('/');
+    if (base_path.back() != '/') {
+      base_path.push_back('/');
     }
-    rewritten_path.append(virtual_path);
+    virtual_path = base_path + virtual_path;
   }
+  virtual_path = ResolveVirtualSymlinks(normalized_rootfs, virtual_path, true);
+  const std::string rewritten_path =
+      RewritePathToRootfs(normalized_rootfs, virtual_path);
   std::string              interpreter_path;
   std::string              interpreter_argument;
   std::string              executable_path;
   std::vector<std::string> argument_prefix;
   if (ReadElfInterpreter(rewritten_path, &interpreter_path)) {
-    executable_path =
-        BuildRealPathInRootfs(normalized_rootfs, interpreter_path);
+    executable_path = RewritePathToRootfs(normalized_rootfs,
+        ResolveVirtualSymlinks(normalized_rootfs, interpreter_path, true));
     argument_prefix = {executable_path, rewritten_path};
   } else if (ReadShebangInterpreter(
                  rewritten_path, &interpreter_path, &interpreter_argument)) {
     const std::string script_interpreter_path =
-        BuildRealPathInRootfs(normalized_rootfs, interpreter_path);
+        RewritePathToRootfs(normalized_rootfs,
+            ResolveVirtualSymlinks(normalized_rootfs, interpreter_path, true));
     executable_path = script_interpreter_path;
     argument_prefix = {script_interpreter_path};
 
     std::string elf_interpreter;
     if (ReadElfInterpreter(script_interpreter_path, &elf_interpreter)) {
-      executable_path =
-          BuildRealPathInRootfs(normalized_rootfs, elf_interpreter);
+      executable_path = RewritePathToRootfs(normalized_rootfs,
+          ResolveVirtualSymlinks(normalized_rootfs, elf_interpreter, true));
       argument_prefix = {executable_path, script_interpreter_path};
     }
     if (!interpreter_argument.empty()) {
@@ -1321,9 +1460,14 @@ void RewritePathArgument(pid_t pid, const std::string& normalized_rootfs,
     if (!ResolveVirtualPathBase(pid, dir_fd, normalized_rootfs, &base_path)) {
       return;
     }
-    virtual_path = ResolveVirtualRelativePath(base_path, virtual_path);
+    if (base_path.back() != '/') {
+      base_path.push_back('/');
+    }
+    virtual_path = base_path + virtual_path;
   }
 
+  virtual_path = ResolveVirtualSymlinks(normalized_rootfs, virtual_path,
+      ShouldFollowFinalSymlink(pid, *regs, arg_index));
   const std::string rewritten_path =
       RewritePathToRootfs(normalized_rootfs, virtual_path);
   if (rewritten_path == original_path) {
@@ -1464,8 +1608,10 @@ void RewriteSockaddrIfNeeded(
     return;
   }
 
-  const std::string rewritten_path =
-      RewritePathToRootfs(normalized_rootfs, original_path);
+  const bool        follow_final_symlink = syscall_number != kSysBind;
+  const std::string rewritten_path       = RewritePathToRootfs(
+      normalized_rootfs, ResolveVirtualSymlinks(normalized_rootfs,
+                             original_path, follow_final_symlink));
   if (rewritten_path == original_path) {
     return;
   }
