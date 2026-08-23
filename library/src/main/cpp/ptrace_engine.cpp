@@ -7,6 +7,7 @@
 #include <fcntl.h>
 #include <limits.h>
 #include <linux/ptrace.h>
+#include <linux/stat.h>
 #include <signal.h>
 #include <stddef.h>
 #include <stdint.h>
@@ -52,6 +53,7 @@ constexpr uint64_t    kSysFchown               = 55;
 constexpr uint64_t    kSysOpenat               = 56;
 constexpr uint64_t    kSysReadlinkat           = 78;
 constexpr uint64_t    kSysNewfstatat           = 79;
+constexpr uint64_t    kSysFstat                = 80;
 constexpr uint64_t    kSysUtimensat            = 88;
 constexpr uint64_t    kSysRenameat2            = 276;
 constexpr uint64_t    kSysStatx                = 291;
@@ -1135,6 +1137,69 @@ bool MaybeEmulateUidGidSyscall(
   }
 }
 
+void ReplaceAppOwnership(struct stat* file_stat, uid_t app_uid, gid_t app_gid) {
+  if (file_stat == nullptr) {
+    return;
+  }
+  if (file_stat->st_uid == app_uid) {
+    file_stat->st_uid = kRootUid;
+  }
+  if (file_stat->st_gid == app_gid) {
+    file_stat->st_gid = kRootGid;
+  }
+}
+
+void ReplaceAppOwnership(
+    struct statx* file_stat, uid_t app_uid, gid_t app_gid) {
+  if (file_stat == nullptr) {
+    return;
+  }
+  if (file_stat->stx_uid == app_uid) {
+    file_stat->stx_uid = kRootUid;
+  }
+  if (file_stat->stx_gid == app_gid) {
+    file_stat->stx_gid = kRootGid;
+  }
+}
+
+void RewriteStatOwnershipIfNeeded(
+    pid_t pid, uid_t app_uid, gid_t app_gid, const user_pt_regs& regs) {
+  if (static_cast<int64_t>(regs.regs[0]) != 0) {
+    return;
+  }
+
+  uint64_t stat_address = 0;
+  switch (regs.regs[8]) {
+    case kSysNewfstatat:
+      stat_address = regs.regs[2];
+      break;
+    case kSysFstat:
+      stat_address = regs.regs[1];
+      break;
+    case kSysStatx: {
+      struct statx file_stat{};
+      stat_address = regs.regs[4];
+      if (stat_address == 0 ||
+          !ReadTraceeMemory(pid, stat_address, &file_stat, sizeof(file_stat))) {
+        return;
+      }
+      ReplaceAppOwnership(&file_stat, app_uid, app_gid);
+      WriteTraceeMemory(pid, stat_address, &file_stat, sizeof(file_stat));
+      return;
+    }
+    default:
+      return;
+  }
+
+  struct stat file_stat{};
+  if (stat_address == 0 ||
+      !ReadTraceeMemory(pid, stat_address, &file_stat, sizeof(file_stat))) {
+    return;
+  }
+  ReplaceAppOwnership(&file_stat, app_uid, app_gid);
+  WriteTraceeMemory(pid, stat_address, &file_stat, sizeof(file_stat));
+}
+
 bool MaybeEmulateUnavailableAuditSocket(
     pid_t pid, TraceeState* state, user_pt_regs* regs) {
   if (state == nullptr || regs == nullptr || regs->regs[8] != kSysSocket ||
@@ -1147,8 +1212,8 @@ bool MaybeEmulateUnavailableAuditSocket(
 }
 
 bool MaybeEmulateShadowLockSyscall(pid_t pid,
-    const std::string& normalized_rootfs, TraceeState* state,
-    user_pt_regs* regs) {
+    const std::string& normalized_rootfs, uid_t app_uid, gid_t app_gid,
+    TraceeState* state, user_pt_regs* regs) {
   if (state == nullptr || regs == nullptr) {
     return false;
   }
@@ -1166,6 +1231,7 @@ bool MaybeEmulateShadowLockSyscall(pid_t pid,
       SetEmulatedSyscallReturn(pid, state, regs, -errno);
       return true;
     }
+    ReplaceAppOwnership(&file_stat, app_uid, app_gid);
     file_stat.st_nlink = 2;
     const int64_t result =
         WriteTraceeMemory(pid, regs->regs[2], &file_stat, sizeof(file_stat)) ?
@@ -1889,6 +1955,8 @@ int TracerMain(const std::string& extract_dst_path,
   prctl(PR_SET_PDEATHSIG, SIGKILL);
 
   const std::string normalized_rootfs = NormalizeRootfsPrefix(extract_dst_path);
+  const uid_t       app_uid           = getuid();
+  const gid_t       app_gid           = getgid();
   if (!PrepareSharedMemoryDirectory(normalized_rootfs)) {
     return 1;
   }
@@ -1998,7 +2066,7 @@ int TracerMain(const std::string& extract_dst_path,
               !MaybeEmulateUidGidSyscall(pid, &state, &regs) &&
               !MaybeEmulateUnavailableAuditSocket(pid, &state, &regs) &&
               !MaybeEmulateShadowLockSyscall(
-                  pid, normalized_rootfs, &state, &regs) &&
+                  pid, normalized_rootfs, app_uid, app_gid, &state, &regs) &&
               !MaybeHandleIoctlSyscall(pid, &state, &regs)) {
             MaybeRewriteAcceptSyscall(pid, &regs);
             MaybeRewritePingSocket(pid, &regs);
@@ -2009,6 +2077,8 @@ int TracerMain(const std::string& extract_dst_path,
               RewritePathArgumentsIfNeeded(pid, normalized_rootfs, &regs);
             }
           }
+        } else {
+          RewriteStatOwnershipIfNeeded(pid, app_uid, app_gid, regs);
         }
       }
       state.expect_entry = !is_syscall_entry;
