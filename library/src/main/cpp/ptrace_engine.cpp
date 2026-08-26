@@ -38,6 +38,14 @@
 namespace {
 
 constexpr const char* kLogTag                  = "andlify-ptrace";
+constexpr uint64_t    kSysSetxattr             = 5;
+constexpr uint64_t    kSysLsetxattr            = 6;
+constexpr uint64_t    kSysGetxattr             = 8;
+constexpr uint64_t    kSysLgetxattr            = 9;
+constexpr uint64_t    kSysListxattr            = 11;
+constexpr uint64_t    kSysLlistxattr           = 12;
+constexpr uint64_t    kSysRemovexattr          = 14;
+constexpr uint64_t    kSysLremovexattr         = 15;
 constexpr uint64_t    kSysMknodat              = 33;
 constexpr uint64_t    kSysMkdirat              = 34;
 constexpr uint64_t    kSysUnlinkat             = 35;
@@ -378,6 +386,10 @@ std::string ResolveVirtualSymlinks(const std::string& normalized_rootfs,
 bool ShouldFollowFinalSymlink(
     pid_t pid, const user_pt_regs& regs, int arg_index) {
   switch (regs.regs[8]) {
+    case kSysLsetxattr:
+    case kSysLgetxattr:
+    case kSysLlistxattr:
+    case kSysLremovexattr:
     case kSysMknodat:
     case kSysMkdirat:
     case kSysUnlinkat:
@@ -1604,6 +1616,14 @@ void RewritePathArgumentsIfNeeded(
     pid_t pid, const std::string& normalized_rootfs, user_pt_regs* regs) {
   const uint64_t syscall_number = regs->regs[8];
   switch (syscall_number) {
+    case kSysSetxattr:
+    case kSysLsetxattr:
+    case kSysGetxattr:
+    case kSysLgetxattr:
+    case kSysListxattr:
+    case kSysLlistxattr:
+    case kSysRemovexattr:
+    case kSysLremovexattr:
     case kSysChdir:
     case kSysExecve:
     case kSysStatfs:
