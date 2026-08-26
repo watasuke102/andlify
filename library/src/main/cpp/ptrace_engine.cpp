@@ -86,6 +86,7 @@ constexpr uint64_t    kSysGeteuid              = 175;
 constexpr uint64_t    kSysGetgid               = 176;
 constexpr uint64_t    kSysGetegid              = 177;
 constexpr uint64_t    kSysIoctl                = 29;
+constexpr uint64_t    kSysGetcwd               = 17;
 constexpr uint64_t    kTcgets                  = 0x5401;
 constexpr uint64_t    kTcsets                  = 0x5402;
 constexpr uint64_t    kTcsetsw                 = 0x5403;
@@ -815,6 +816,40 @@ void SetEmulatedSyscallReturn(
 
   state->has_emulated_return = true;
   state->emulated_return     = static_cast<uint64_t>(return_value);
+}
+
+bool MaybeEmulateGetcwd(pid_t pid, const std::string& normalized_rootfs,
+    TraceeState* state, user_pt_regs* regs) {
+  if (state == nullptr || regs == nullptr || regs->regs[8] != kSysGetcwd) {
+    return false;
+  }
+
+  const uint64_t buffer_address = regs->regs[0];
+  const size_t   buffer_size    = static_cast<size_t>(regs->regs[1]);
+  if (buffer_size == 0) {
+    SetEmulatedSyscallReturn(pid, state, regs, -EINVAL);
+    return true;
+  }
+
+  std::string virtual_path;
+  if (!ResolveVirtualPathBase(
+          pid, AT_FDCWD, normalized_rootfs, &virtual_path)) {
+    return false;
+  }
+
+  const size_t result_size = virtual_path.size() + 1;
+  if (result_size > buffer_size) {
+    SetEmulatedSyscallReturn(pid, state, regs, -ERANGE);
+    return true;
+  }
+  if (buffer_address == 0 || !WriteTraceeMemory(pid, buffer_address,
+                                 virtual_path.c_str(), result_size)) {
+    SetEmulatedSyscallReturn(pid, state, regs, -EFAULT);
+    return true;
+  }
+
+  SetEmulatedSyscallReturn(pid, state, regs, result_size);
+  return true;
 }
 
 bool MaybeEmulateProcSelfReadlink(pid_t pid,
@@ -2060,7 +2095,8 @@ int TracerMain(const std::string& extract_dst_path,
           RewriteSockaddrIfNeeded(pid, normalized_rootfs, &regs);
         }
         if (is_syscall_entry) {
-          if (!MaybeEmulateProcSelfReadlink(
+          if (!MaybeEmulateGetcwd(pid, normalized_rootfs, &state, &regs) &&
+              !MaybeEmulateProcSelfReadlink(
                   pid, normalized_rootfs, &state, &regs) &&
               !MaybeEmulatePrctlSyscall(pid, &state, &regs) &&
               !MaybeEmulateUidGidSyscall(pid, &state, &regs) &&
