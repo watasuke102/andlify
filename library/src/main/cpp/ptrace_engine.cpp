@@ -109,7 +109,6 @@ constexpr uint64_t    kTiocgwinsz              = 0x5413;
 constexpr size_t      kPathReadLimit           = 4096;
 constexpr uint64_t    kStackScratchOffset      = 0x800;
 constexpr uint64_t    kExecScratchSize         = 0x2000;
-constexpr size_t      kMaxExecArgCount         = 64;
 constexpr size_t      kMaxSymlinkDepth         = 40;
 constexpr uint64_t    kRootUid                 = 0;
 constexpr uint64_t    kRootGid                 = 0;
@@ -624,14 +623,14 @@ ExecPlan BuildExecPlan(const std::string& extract_dst_path,
   return plan;
 }
 
-bool ReadTraceeArgv(
-    pid_t pid, uint64_t argv_address, std::vector<uint64_t>* argv_out) {
-  if (argv_out == nullptr || argv_address == 0) {
+bool ReadTraceeArgv(pid_t pid, uint64_t argv_address, size_t max_arg_count,
+    std::vector<uint64_t>* argv_out) {
+  if (argv_out == nullptr || argv_address == 0 || max_arg_count == 0) {
     return false;
   }
 
   argv_out->clear();
-  for (size_t i = 0; i < kMaxExecArgCount; ++i) {
+  for (size_t i = 0; i <= max_arg_count; ++i) {
     uint64_t arg_ptr = 0;
     if (!ReadTraceeMemory(pid, argv_address + (i * sizeof(uint64_t)), &arg_ptr,
             sizeof(arg_ptr))) {
@@ -639,6 +638,9 @@ bool ReadTraceeArgv(
     }
     if (arg_ptr == 0) {
       return !argv_out->empty();
+    }
+    if (i == max_arg_count) {
+      return false;
     }
     argv_out->push_back(arg_ptr);
   }
@@ -727,8 +729,26 @@ ExecRewriteResult RewriteExecveIfNeeded(pid_t pid,
     return ExecRewriteResult::kFailed;
   }
 
+  size_t argument_prefix_bytes = 0;
+  for (const std::string& argument : argument_prefix) {
+    if (argument.size() + 1 > kExecScratchSize - argument_prefix_bytes) {
+      return ExecRewriteResult::kFailed;
+    }
+    argument_prefix_bytes =
+        AlignUp(argument_prefix_bytes + argument.size() + 1, sizeof(uint64_t));
+  }
+
+  const size_t argv_pointer_capacity =
+      (kExecScratchSize - argument_prefix_bytes) / sizeof(uint64_t);
+  if (argv_pointer_capacity <= argument_prefix.size()) {
+    return ExecRewriteResult::kFailed;
+  }
+
   std::vector<uint64_t> original_argv;
-  if (!ReadTraceeArgv(pid, argv_address, &original_argv)) {
+  const size_t          max_original_arg_count =
+      argv_pointer_capacity - argument_prefix.size();
+  if (!ReadTraceeArgv(
+          pid, argv_address, max_original_arg_count, &original_argv)) {
     __android_log_print(ANDROID_LOG_WARN, kLogTag,
         "Failed to read argv for execve pid=%d path=%s", pid,
         rewritten_path.c_str());
