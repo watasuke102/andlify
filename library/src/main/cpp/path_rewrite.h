@@ -6,6 +6,12 @@ inline constexpr char kInotifyMaxUserWatchesPath[] =
     "/proc/sys/fs/inotify/max_user_watches";
 inline constexpr char kInotifyMaxUserWatchesBackingPath[] =
     "/tmp/.andlify-inotify-max-user-watches";
+inline constexpr char kOverflowUidPath[] = "/proc/sys/kernel/overflowuid";
+inline constexpr char kOverflowUidBackingPath[] =
+    "/tmp/.andlify-kernel-overflowuid";
+inline constexpr char kOverflowGidPath[] = "/proc/sys/kernel/overflowgid";
+inline constexpr char kOverflowGidBackingPath[] =
+    "/tmp/.andlify-kernel-overflowgid";
 
 std::string NormalizeRootfsPrefix(const std::string& rootfs_path);
 bool        IsAbsoluteUnixPath(const std::string& path);

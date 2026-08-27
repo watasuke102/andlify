@@ -10,6 +10,7 @@
 #include <linux/ptrace.h>
 #include <linux/sched.h>
 #include <linux/stat.h>
+#include <net/if.h>
 #include <signal.h>
 #include <stddef.h>
 #include <stdint.h>
@@ -123,6 +124,7 @@ constexpr uint64_t    kTcsetsf2               = 0x402c542D;
 constexpr uint64_t    kTiocgpgrp              = 0x540F;
 constexpr uint64_t    kTiocspgrp              = 0x5410;
 constexpr uint64_t    kTiocgwinsz             = 0x5413;
+constexpr uint64_t    kSiocgifindex           = 0x8933;
 constexpr size_t      kPathReadLimit          = 4096;
 constexpr uint64_t    kStackScratchOffset     = 0x800;
 constexpr uint64_t    kExecScratchSize        = 0x2000;
@@ -157,6 +159,7 @@ constexpr const char* kDefaultEnvironment[][2] = {
 };
 
 constexpr char kInotifyMaxUserWatchesValue[] = "8192\n";
+constexpr char kOverflowIdValue[]            = "65534\n";
 
 struct TraceeState {
   bool                              expect_entry               = true;
@@ -169,17 +172,22 @@ struct TraceeState {
   uint64_t                          emulated_return            = 0;
   std::string                       executable_path;
   std::string                       pending_executable_path;
+  std::string                       pending_open_permission_path;
   std::string                       emulated_old_root;
-  uint32_t                          real_uid      = kRootUid;
-  uint32_t                          effective_uid = kRootUid;
-  uint32_t                          saved_uid     = kRootUid;
-  uint32_t                          fs_uid        = kRootUid;
-  uint32_t                          real_gid      = kRootGid;
-  uint32_t                          effective_gid = kRootGid;
-  uint32_t                          saved_gid     = kRootGid;
-  uint32_t                          fs_gid        = kRootGid;
+  std::string                       emulated_mountinfo_path;
+  mode_t                            pending_open_permission_mode = 0;
+  uint32_t                          real_uid                     = kRootUid;
+  uint32_t                          effective_uid                = kRootUid;
+  uint32_t                          saved_uid                    = kRootUid;
+  uint32_t                          fs_uid                       = kRootUid;
+  uint32_t                          real_gid                     = kRootGid;
+  uint32_t                          effective_gid                = kRootGid;
+  uint32_t                          saved_gid                    = kRootGid;
+  uint32_t                          fs_gid                       = kRootGid;
   std::vector<uint32_t>             supplementary_groups{kRootGid};
   std::unordered_set<std::string>   copied_lock_sources;
+  std::unordered_set<std::string>   emulated_mount_nodes;
+  std::unordered_set<std::string>   emulated_mount_points{"/"};
   std::unordered_map<int, uint32_t> emulated_netlink_route_fds;
   rlimit                            file_descriptor_limit{};
 };
@@ -319,6 +327,10 @@ std::string ResolveVirtualRelativePath(
 
 std::string ResolveVirtualSymlinks(const std::string& normalized_rootfs,
     const std::string& path, bool follow_final_symlink) {
+  if (IsPassthroughUnixPath(path)) {
+    return path;
+  }
+
   bool requires_directory = path.size() > 1 && path.back() == '/';
   std::deque<std::string> pending_components;
   size_t                  start = 0;
@@ -952,8 +964,194 @@ bool MaybeEmulateMountNamespaceOperation(pid_t pid,
     return false;
   }
 
+  const auto resolve_path = [&](int dir_fd, uint64_t address,
+                                std::string* virtual_path,
+                                std::string* real_path) {
+    if (!ReadTraceeCString(pid, address, kPathReadLimit, virtual_path) ||
+        virtual_path->empty()) {
+      return false;
+    }
+    if (!IsAbsoluteUnixPath(*virtual_path)) {
+      std::string base_path;
+      if (!ResolveVirtualPathBase(pid, dir_fd, normalized_rootfs, &base_path)) {
+        return false;
+      }
+      *virtual_path = ResolveVirtualRelativePath(base_path, *virtual_path);
+    }
+    if (!state->emulated_old_root.empty() &&
+        (*virtual_path == state->emulated_old_root ||
+            virtual_path->rfind(state->emulated_old_root + "/", 0) == 0)) {
+      *virtual_path = virtual_path->substr(state->emulated_old_root.size());
+      if (virtual_path->empty()) {
+        *virtual_path = "/";
+      }
+    }
+    *real_path = RewritePathToRootfs(normalized_rootfs,
+        ResolveVirtualSymlinks(normalized_rootfs, *virtual_path, false));
+    return true;
+  };
+  const auto is_in_emulated_mount = [&](const std::string& path) {
+    return std::any_of(state->emulated_mount_points.begin(),
+        state->emulated_mount_points.end(),
+        [&](const std::string& mount_point) {
+          return mount_point != "/" &&
+                 (path == mount_point || path.rfind(mount_point + "/", 0) == 0);
+        });
+  };
+
   switch (regs->regs[8]) {
-    case kSysMount:
+    case kSysMkdirat: {
+      std::string path;
+      std::string real_path;
+      if (!resolve_path(static_cast<int>(regs->regs[0]), regs->regs[1], &path,
+              &real_path) ||
+          !is_in_emulated_mount(path)) {
+        return false;
+      }
+
+      struct stat existing_stat{};
+      if (lstat(real_path.c_str(), &existing_stat) != 0) {
+        if (errno == ENOENT) {
+          state->emulated_mount_nodes.insert(path);
+        }
+        return false;
+      }
+      if (!S_ISDIR(existing_stat.st_mode) ||
+          state->emulated_mount_nodes.count(path) != 0) {
+        return false;
+      }
+      state->emulated_mount_nodes.insert(path);
+      SetEmulatedSyscallReturn(pid, state, regs, 0);
+      return true;
+    }
+    case kSysSymlinkat: {
+      std::string path;
+      std::string real_path;
+      if (!resolve_path(static_cast<int>(regs->regs[1]), regs->regs[2], &path,
+              &real_path) ||
+          !is_in_emulated_mount(path)) {
+        return false;
+      }
+
+      struct stat existing_stat{};
+      if (lstat(real_path.c_str(), &existing_stat) != 0) {
+        if (errno == ENOENT) {
+          state->emulated_mount_nodes.insert(path);
+        }
+        return false;
+      }
+      if (!S_ISLNK(existing_stat.st_mode) ||
+          state->emulated_mount_nodes.count(path) != 0) {
+        return false;
+      }
+
+      std::string   target;
+      char          existing_target[kPathReadLimit];
+      const ssize_t existing_target_size =
+          readlink(real_path.c_str(), existing_target, sizeof(existing_target));
+      if (!ReadTraceeCString(pid, regs->regs[0], kPathReadLimit, &target) ||
+          existing_target_size < 0 ||
+          static_cast<size_t>(existing_target_size) != target.size() ||
+          memcmp(existing_target, target.data(), target.size()) != 0) {
+        return false;
+      }
+      state->emulated_mount_nodes.insert(path);
+      SetEmulatedSyscallReturn(pid, state, regs, 0);
+      return true;
+    }
+    case kSysOpenat:
+    case kSysOpenat2: {
+      uint64_t flags = regs->regs[2];
+      if (regs->regs[8] == kSysOpenat2 &&
+          !ReadTraceeMemory(pid, regs->regs[2], &flags, sizeof(flags))) {
+        return false;
+      }
+      if ((flags & O_CREAT) == 0) {
+        return false;
+      }
+
+      std::string path;
+      std::string real_path;
+      if (!resolve_path(static_cast<int>(regs->regs[0]), regs->regs[1], &path,
+              &real_path)) {
+        return false;
+      }
+      struct stat existing_stat{};
+      if (lstat(real_path.c_str(), &existing_stat) != 0) {
+        return false;
+      }
+      if ((flags & O_EXCL) != 0) {
+        SetEmulatedSyscallReturn(pid, state, regs, -EEXIST);
+        return true;
+      }
+      if ((flags & O_ACCMODE) == O_RDONLY || state->fs_uid != kRootUid ||
+          !S_ISREG(existing_stat.st_mode) ||
+          (existing_stat.st_mode & S_IWUSR) != 0) {
+        return false;
+      }
+      if (chmod(real_path.c_str(), existing_stat.st_mode | S_IWUSR) != 0) {
+        return false;
+      }
+      state->pending_open_permission_path = real_path;
+      state->pending_open_permission_mode = existing_stat.st_mode & 07777;
+      return false;
+    }
+    case kSysMount: {
+      std::string destination;
+      if (ReadTraceeCString(pid, regs->regs[1], kPathReadLimit, &destination) &&
+          !destination.empty()) {
+        if (!state->emulated_old_root.empty() &&
+            (destination == state->emulated_old_root ||
+                destination.rfind(state->emulated_old_root + "/", 0) == 0)) {
+          destination = destination.substr(state->emulated_old_root.size());
+          if (destination.empty()) {
+            destination = "/";
+          }
+        }
+
+        constexpr std::string_view self_fd_prefix   = "/proc/self/fd/";
+        constexpr std::string_view thread_fd_prefix = "/proc/thread-self/fd/";
+        std::string_view           fd_text;
+        if (destination.rfind(self_fd_prefix, 0) == 0) {
+          fd_text = std::string_view(destination).substr(self_fd_prefix.size());
+        } else if (destination.rfind(thread_fd_prefix, 0) == 0) {
+          fd_text =
+              std::string_view(destination).substr(thread_fd_prefix.size());
+        }
+
+        char*      end = nullptr;
+        const long destination_fd =
+            fd_text.empty() ? -1 : strtol(fd_text.data(), &end, 10);
+        if (!fd_text.empty() && end == fd_text.data() + fd_text.size() &&
+            destination_fd >= 0 && destination_fd <= INT_MAX) {
+          char fd_path[64];
+          snprintf(
+              fd_path, sizeof(fd_path), "/proc/%d/fd/%ld", pid, destination_fd);
+          char          real_destination[kPathReadLimit];
+          const ssize_t real_destination_size =
+              readlink(fd_path, real_destination, sizeof(real_destination) - 1);
+          if (real_destination_size > 0) {
+            real_destination[real_destination_size] = '\0';
+            state->emulated_mount_points.emplace(real_destination);
+          }
+          ResolveVirtualPathBase(pid, static_cast<int>(destination_fd),
+              normalized_rootfs, &destination);
+        } else if (!IsAbsoluteUnixPath(destination)) {
+          std::string cwd;
+          if (ResolveVirtualPathBase(pid, AT_FDCWD, normalized_rootfs, &cwd)) {
+            destination = ResolveVirtualRelativePath(cwd, destination);
+          }
+        }
+        state->emulated_mount_points.insert(destination);
+        state->emulated_mount_points.insert(
+            RewritePathToRootfs(normalized_rootfs, destination));
+        __android_log_print(ANDROID_LOG_VERBOSE, kLogTag,
+            "Recorded emulated mount pid=%d destination=%s mounts=%zu", pid,
+            destination.c_str(), state->emulated_mount_points.size());
+      }
+      SetEmulatedSyscallReturn(pid, state, regs, 0);
+      return true;
+    }
     case kSysUmount2:
       SetEmulatedSyscallReturn(pid, state, regs, 0);
       return true;
@@ -995,6 +1193,132 @@ bool MaybeEmulateMountNamespaceOperation(pid_t pid,
     default:
       return false;
   }
+}
+
+void RestoreOpenPermission(TraceeState* state) {
+  if (state == nullptr || state->pending_open_permission_path.empty()) {
+    return;
+  }
+
+  if (chmod(state->pending_open_permission_path.c_str(),
+          state->pending_open_permission_mode) != 0) {
+    __android_log_print(ANDROID_LOG_WARN, kLogTag,
+        "Failed to restore file permissions path=%s: %s",
+        state->pending_open_permission_path.c_str(), strerror(errno));
+  }
+  state->pending_open_permission_path.clear();
+  state->pending_open_permission_mode = 0;
+}
+
+void RedirectEmulatedMountInfo(pid_t pid, const std::string& normalized_rootfs,
+    TraceeState* state, user_pt_regs* regs) {
+  if (state == nullptr || regs == nullptr || !state->emulated_mount_namespace ||
+      (regs->regs[8] != kSysOpenat && regs->regs[8] != kSysOpenat2) ||
+      regs->regs[1] == 0) {
+    return;
+  }
+
+  std::string path;
+  if (!ReadTraceeCString(pid, regs->regs[1], kPathReadLimit, &path) ||
+      path.empty()) {
+    return;
+  }
+  if (!IsAbsoluteUnixPath(path)) {
+    std::string base_path;
+    if (!ResolveVirtualPathBase(pid, static_cast<int>(regs->regs[0]),
+            normalized_rootfs, &base_path)) {
+      return;
+    }
+    path = ResolveVirtualRelativePath(base_path, path);
+  }
+  if (!state->emulated_old_root.empty() &&
+      (path == state->emulated_old_root ||
+          path.rfind(state->emulated_old_root + "/", 0) == 0)) {
+    path = path.substr(state->emulated_old_root.size());
+    if (path.empty()) {
+      path = "/";
+    }
+  }
+
+  const std::string process_mountinfo =
+      "/proc/" + std::to_string(pid) + "/mountinfo";
+  if (path != "/proc/self/mountinfo" && path != "/proc/thread-self/mountinfo" &&
+      path != process_mountinfo) {
+    return;
+  }
+
+  state->emulated_mountinfo_path =
+      normalized_rootfs + "/tmp/.andlify-mountinfo-" + std::to_string(pid);
+  const int fd = open(state->emulated_mountinfo_path.c_str(),
+      O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0600);
+  if (fd < 0) {
+    __android_log_print(ANDROID_LOG_WARN, kLogTag,
+        "Failed to create emulated mountinfo pid=%d path=%s: %s", pid,
+        state->emulated_mountinfo_path.c_str(), strerror(errno));
+    return;
+  }
+
+  std::string content  = "1 0 0:1 / / rw,nosuid,nodev - tmpfs andlify rw\n";
+  int         mount_id = 2;
+  for (const std::string& mount_point : state->emulated_mount_points) {
+    if (mount_point == "/") {
+      continue;
+    }
+    std::string escaped_path;
+    for (const char value : mount_point) {
+      switch (value) {
+        case ' ':
+          escaped_path.append("\\040");
+          break;
+        case '\t':
+          escaped_path.append("\\011");
+          break;
+        case '\n':
+          escaped_path.append("\\012");
+          break;
+        case '\\':
+          escaped_path.append("\\134");
+          break;
+        default:
+          escaped_path.push_back(value);
+          break;
+      }
+    }
+    content.append(std::to_string(mount_id));
+    content.append(" 1 0:1 / ");
+    content.append(escaped_path);
+    content.append(" rw,nosuid,nodev - tmpfs andlify rw\n");
+    ++mount_id;
+  }
+
+  size_t written = 0;
+  while (written < content.size()) {
+    const ssize_t result =
+        write(fd, content.data() + written, content.size() - written);
+    if (result < 0 && errno == EINTR) {
+      continue;
+    }
+    if (result <= 0) {
+      close(fd);
+      return;
+    }
+    written += static_cast<size_t>(result);
+  }
+  close(fd);
+
+  __android_log_print(ANDROID_LOG_VERBOSE, kLogTag,
+      "Redirecting mountinfo pid=%d mounts=%zu path=%s", pid,
+      state->emulated_mount_points.size(),
+      state->emulated_mountinfo_path.c_str());
+
+  if (regs->sp <= kStackScratchOffset ||
+      !WriteTraceeMemory(pid, regs->sp - kStackScratchOffset,
+          state->emulated_mountinfo_path.c_str(),
+          state->emulated_mountinfo_path.size() + 1)) {
+    return;
+  }
+  regs->regs[1] = regs->sp - kStackScratchOffset;
+  SetRegs(pid, *regs);
 }
 
 bool MaybeEmulateNetworkNamespaceOperation(
@@ -1865,6 +2189,35 @@ bool MaybeHandleIoctlSyscall(
   const uint64_t request = regs->regs[1];
   const uint64_t fd      = regs->regs[0];
 
+  if (state != nullptr && request == kSiocgifindex) {
+    ifreq interface_request{};
+    if (regs->regs[2] == 0 ||
+        !ReadTraceeMemory(pid, regs->regs[2], &interface_request,
+            sizeof(interface_request))) {
+      SetEmulatedSyscallReturn(pid, state, regs, -EFAULT);
+      return true;
+    }
+
+    interface_request.ifr_name[IFNAMSIZ - 1] = '\0';
+    const bool is_loopback = strcmp(interface_request.ifr_name, "lo") == 0;
+    if (!is_loopback && !state->emulated_network_namespace) {
+      return false;
+    }
+    if (!is_loopback) {
+      SetEmulatedSyscallReturn(pid, state, regs, -ENODEV);
+      return true;
+    }
+
+    interface_request.ifr_ifindex = 1;
+    if (!WriteTraceeMemory(pid, regs->regs[2], &interface_request,
+            sizeof(interface_request))) {
+      SetEmulatedSyscallReturn(pid, state, regs, -EFAULT);
+      return true;
+    }
+    SetEmulatedSyscallReturn(pid, state, regs, 0);
+    return true;
+  }
+
   char path[256];
   snprintf(path, sizeof(path), "/proc/%d/fd/%llu", pid,
       static_cast<unsigned long long>(fd));
@@ -2393,57 +2746,70 @@ bool PrepareSharedMemoryDirectory(const std::string& normalized_rootfs) {
   return true;
 }
 
-bool PrepareInotifyMaxUserWatchesFile(const std::string& normalized_rootfs) {
-  const std::string backing_path =
-      normalized_rootfs + kInotifyMaxUserWatchesBackingPath;
-  const std::string temporary_template = backing_path + ".XXXXXX";
-  std::vector<char> temporary_path_buffer(
-      temporary_template.begin(), temporary_template.end());
-  temporary_path_buffer.push_back('\0');
+bool PrepareEmulatedProcFiles(const std::string& normalized_rootfs) {
+  struct File {
+    const char* backing_path;
+    const char* value;
+    size_t      value_size;
+  };
+  constexpr File files[] = {
+      {kInotifyMaxUserWatchesBackingPath, kInotifyMaxUserWatchesValue,
+       sizeof(kInotifyMaxUserWatchesValue) - 1                                                     },
+      {kOverflowUidBackingPath,           kOverflowIdValue,            sizeof(kOverflowIdValue) - 1},
+      {kOverflowGidBackingPath,           kOverflowIdValue,            sizeof(kOverflowIdValue) - 1},
+  };
 
-  const int fd = mkostemp(temporary_path_buffer.data(), O_CLOEXEC);
-  if (fd < 0) {
-    __android_log_print(ANDROID_LOG_ERROR, kLogTag,
-        "Failed to create temporary inotify limit file: %s (%s)",
-        temporary_template.c_str(), strerror(errno));
-    return false;
-  }
-  const std::string temporary_path(temporary_path_buffer.data());
+  for (const File& file : files) {
+    const std::string backing_path = normalized_rootfs + file.backing_path;
+    const std::string temporary_template = backing_path + ".XXXXXX";
+    std::vector<char> temporary_path_buffer(
+        temporary_template.begin(), temporary_template.end());
+    temporary_path_buffer.push_back('\0');
 
-  size_t written = 0;
-  while (written < sizeof(kInotifyMaxUserWatchesValue) - 1) {
-    const ssize_t result = write(fd, kInotifyMaxUserWatchesValue + written,
-        sizeof(kInotifyMaxUserWatchesValue) - 1 - written);
-    if (result < 0 && errno == EINTR) {
-      continue;
-    }
-    if (result <= 0) {
+    const int fd = mkostemp(temporary_path_buffer.data(), O_CLOEXEC);
+    if (fd < 0) {
       __android_log_print(ANDROID_LOG_ERROR, kLogTag,
-          "Failed to write inotify limit file: %s (%s)", temporary_path.c_str(),
-          strerror(errno));
+          "Failed to create temporary proc file: %s (%s)",
+          temporary_template.c_str(), strerror(errno));
+      return false;
+    }
+    const std::string temporary_path(temporary_path_buffer.data());
+
+    size_t written = 0;
+    while (written < file.value_size) {
+      const ssize_t result =
+          write(fd, file.value + written, file.value_size - written);
+      if (result < 0 && errno == EINTR) {
+        continue;
+      }
+      if (result <= 0) {
+        __android_log_print(ANDROID_LOG_ERROR, kLogTag,
+            "Failed to write proc file: %s (%s)", temporary_path.c_str(),
+            strerror(errno));
+        close(fd);
+        unlink(temporary_path.c_str());
+        return false;
+      }
+      written += static_cast<size_t>(result);
+    }
+
+    if (fchmod(fd, 0444) != 0) {
+      __android_log_print(ANDROID_LOG_ERROR, kLogTag,
+          "Failed to set proc file permissions: %s (%s)",
+          temporary_path.c_str(), strerror(errno));
       close(fd);
       unlink(temporary_path.c_str());
       return false;
     }
-    written += static_cast<size_t>(result);
-  }
-
-  if (fchmod(fd, 0444) != 0) {
-    __android_log_print(ANDROID_LOG_ERROR, kLogTag,
-        "Failed to set inotify limit file permissions: %s (%s)",
-        temporary_path.c_str(), strerror(errno));
     close(fd);
-    unlink(temporary_path.c_str());
-    return false;
-  }
-  close(fd);
 
-  if (rename(temporary_path.c_str(), backing_path.c_str()) != 0) {
-    __android_log_print(ANDROID_LOG_ERROR, kLogTag,
-        "Failed to publish inotify limit file: %s (%s)", backing_path.c_str(),
-        strerror(errno));
-    unlink(temporary_path.c_str());
-    return false;
+    if (rename(temporary_path.c_str(), backing_path.c_str()) != 0) {
+      __android_log_print(ANDROID_LOG_ERROR, kLogTag,
+          "Failed to publish proc file: %s (%s)", backing_path.c_str(),
+          strerror(errno));
+      unlink(temporary_path.c_str());
+      return false;
+    }
   }
   return true;
 }
@@ -2459,7 +2825,7 @@ int TracerMain(const std::string& extract_dst_path,
   if (!PrepareSharedMemoryDirectory(normalized_rootfs)) {
     return 1;
   }
-  if (!PrepareInotifyMaxUserWatchesFile(normalized_rootfs)) {
+  if (!PrepareEmulatedProcFiles(normalized_rootfs)) {
     return 1;
   }
 
@@ -2514,6 +2880,9 @@ int TracerMain(const std::string& extract_dst_path,
       __android_log_print(ANDROID_LOG_INFO, kLogTag, "pid=%d exited status=%d",
           pid, WEXITSTATUS(wait_status));
       tracked_pids.erase(pid);
+      if (!states[pid].emulated_mountinfo_path.empty()) {
+        unlink(states[pid].emulated_mountinfo_path.c_str());
+      }
       states.erase(pid);
       continue;
     }
@@ -2521,6 +2890,9 @@ int TracerMain(const std::string& extract_dst_path,
       __android_log_print(ANDROID_LOG_WARN, kLogTag, "pid=%d killed signal=%d",
           pid, WTERMSIG(wait_status));
       tracked_pids.erase(pid);
+      if (!states[pid].emulated_mountinfo_path.empty()) {
+        unlink(states[pid].emulated_mountinfo_path.c_str());
+      }
       states.erase(pid);
       continue;
     }
@@ -2553,6 +2925,7 @@ int TracerMain(const std::string& extract_dst_path,
       }
 
       if (state.has_emulated_return && !is_syscall_entry) {
+        RestoreOpenPermission(&state);
         ApplyEmulatedSyscallReturn(pid, &state);
         state.expect_entry = true;
         ResumeSyscall(pid, 0);
@@ -2562,6 +2935,7 @@ int TracerMain(const std::string& extract_dst_path,
       user_pt_regs regs{};
       if (GetRegs(pid, &regs)) {
         if (!is_syscall_entry) {
+          RestoreOpenPermission(&state);
           TrackEmulatedNetworkNamespaceFd(&state, regs);
           if (regs.regs[8] == kSysSendmsg ||
               (regs.regs[8] == kSysRecvmsg &&
@@ -2580,6 +2954,7 @@ int TracerMain(const std::string& extract_dst_path,
           }
           RedirectUserNamespaceControlFile(
               pid, normalized_rootfs, state, &regs);
+          RedirectEmulatedMountInfo(pid, normalized_rootfs, &state, &regs);
           if (!MaybeEmulateNamespaceSyscall(pid, &state, &regs) &&
               !MaybeEmulateMountNamespaceOperation(
                   pid, normalized_rootfs, &state, &regs) &&
@@ -2627,8 +3002,12 @@ int TracerMain(const std::string& extract_dst_path,
           child_state.options_applied     = false;
           child_state.has_emulated_return = false;
           child_state.emulated_return     = 0;
+          child_state.emulated_mountinfo_path.clear();
+          child_state.pending_open_permission_path.clear();
+          child_state.pending_open_permission_mode = 0;
           child_state.pending_executable_path.clear();
-          states.emplace(static_cast<pid_t>(new_pid), std::move(child_state));
+          states.insert_or_assign(
+              static_cast<pid_t>(new_pid), std::move(child_state));
         }
       } else if (event == PTRACE_EVENT_EXEC &&
                  !state.pending_executable_path.empty()) {
