@@ -8,6 +8,12 @@ import java.io.InputStream
 import java.io.InputStreamReader
 import java.io.OutputStream
 import java.nio.charset.StandardCharsets
+import java.nio.file.FileVisitResult
+import java.nio.file.Files
+import java.nio.file.LinkOption
+import java.nio.file.Path
+import java.nio.file.SimpleFileVisitor
+import java.nio.file.attribute.BasicFileAttributes
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicInteger
 
@@ -30,6 +36,9 @@ class ChrootSession(
 
     fun start(): Boolean {
         if (pid > 0) {
+            return false
+        }
+        if (!clearRuntimeDirectories()) {
             return false
         }
 
@@ -70,6 +79,45 @@ class ChrootSession(
             true
         } catch (e: IOException) {
             onOutput("Failed to create session pipes: ${e.message}", true)
+            false
+        }
+    }
+
+    private fun clearRuntimeDirectories(): Boolean {
+        val visitor = object : SimpleFileVisitor<Path>() {
+            override fun visitFile(file: Path, attrs: BasicFileAttributes): FileVisitResult {
+                Files.delete(file)
+                return FileVisitResult.CONTINUE
+            }
+
+            override fun postVisitDirectory(dir: Path, exc: IOException?): FileVisitResult {
+                if (exc != null) {
+                    throw exc
+                }
+                Files.delete(dir)
+                return FileVisitResult.CONTINUE
+            }
+        }
+
+        return try {
+            for (name in listOf("run", "tmp")) {
+                val directory = Path.of(rootfsPath, name)
+                if (!Files.exists(directory, LinkOption.NOFOLLOW_LINKS)) {
+                    continue
+                }
+                if (!Files.isDirectory(directory, LinkOption.NOFOLLOW_LINKS)) {
+                    onOutput("Failed to clear /$name: not a directory", true)
+                    return false
+                }
+                Files.newDirectoryStream(directory).use { entries ->
+                    for (entry in entries) {
+                        Files.walkFileTree(entry, visitor)
+                    }
+                }
+            }
+            true
+        } catch (e: IOException) {
+            onOutput("Failed to clear runtime directories: ${e.message}", true)
             false
         }
     }
