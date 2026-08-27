@@ -2169,7 +2169,7 @@ int TracerMain(const std::string& extract_dst_path,
       continue;
     }
 
-    if (signal_number == SIGSTOP || signal_number == SIGCHLD) {
+    if (signal_number == SIGSTOP) {
       ResumeSyscall(pid, 0);
       continue;
     }
