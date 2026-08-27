@@ -18,6 +18,7 @@
 #include <sys/file.h>
 #include <sys/prctl.h>
 #include <sys/ptrace.h>
+#include <sys/resource.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/types.h>
@@ -82,7 +83,10 @@ constexpr uint64_t    kSysAccept              = 202;
 constexpr uint64_t    kSysConnect             = 203;
 constexpr uint64_t    kSysSendto              = 206;
 constexpr uint64_t    kSysRecvfrom            = 207;
+constexpr uint64_t    kSysSendmsg             = 211;
+constexpr uint64_t    kSysRecvmsg             = 212;
 constexpr uint64_t    kSysAccept4             = 242;
+constexpr uint64_t    kSysPrlimit64           = 261;
 constexpr uint64_t    kSysSetregid            = 143;
 constexpr uint64_t    kSysSetgid              = 144;
 constexpr uint64_t    kSysSetreuid            = 145;
@@ -95,6 +99,8 @@ constexpr uint64_t    kSysSetfsuid            = 151;
 constexpr uint64_t    kSysSetfsgid            = 152;
 constexpr uint64_t    kSysGetgroups           = 158;
 constexpr uint64_t    kSysSetgroups           = 159;
+constexpr uint64_t    kSysGetrlimit           = 163;
+constexpr uint64_t    kSysSetrlimit           = 164;
 constexpr uint64_t    kSysPrctl               = 167;
 constexpr uint64_t    kSysClone               = 220;
 constexpr uint64_t    kSysUnshare             = 97;
@@ -136,6 +142,7 @@ constexpr uint64_t    kNetlinkAudit           = 9;
 constexpr uint64_t    kNetlinkRoute           = 0;
 constexpr uint32_t    kUnchangedId            = UINT32_MAX;
 constexpr uint64_t    kMaxSupplementaryGroups = 65536;
+constexpr size_t      kMaxControlMessageSize  = 65536;
 constexpr uint64_t    kNamespaceCloneFlags =
     CLONE_NEWCGROUP | CLONE_NEWIPC | CLONE_NEWNET | CLONE_NEWNS | CLONE_NEWPID |
     CLONE_NEWUSER | CLONE_NEWUTS;
@@ -174,6 +181,13 @@ struct TraceeState {
   std::vector<uint32_t>             supplementary_groups{kRootGid};
   std::unordered_set<std::string>   copied_lock_sources;
   std::unordered_map<int, uint32_t> emulated_netlink_route_fds;
+  rlimit                            file_descriptor_limit{};
+};
+
+struct UnixCredentials {
+  int32_t  pid;
+  uint32_t uid;
+  uint32_t gid;
 };
 
 struct ExecPlan {
@@ -1471,6 +1485,139 @@ bool MaybeEmulateUidGidSyscall(
   }
 }
 
+bool MaybeEmulateFileDescriptorLimit(
+    pid_t pid, TraceeState* state, user_pt_regs* regs) {
+  if (state == nullptr || regs == nullptr) {
+    return false;
+  }
+
+  uint64_t new_limit_address = 0;
+  uint64_t old_limit_address = 0;
+  switch (regs->regs[8]) {
+    case kSysGetrlimit:
+      if (regs->regs[0] != RLIMIT_NOFILE) {
+        return false;
+      }
+      old_limit_address = regs->regs[1];
+      break;
+    case kSysSetrlimit:
+      if (regs->regs[0] != RLIMIT_NOFILE) {
+        return false;
+      }
+      new_limit_address = regs->regs[1];
+      break;
+    case kSysPrlimit64:
+      if ((regs->regs[0] != 0 && regs->regs[0] != static_cast<uint64_t>(pid)) ||
+          regs->regs[1] != RLIMIT_NOFILE) {
+        return false;
+      }
+      new_limit_address = regs->regs[2];
+      old_limit_address = regs->regs[3];
+      break;
+    default:
+      return false;
+  }
+
+  const rlimit old_limit = state->file_descriptor_limit;
+  if (new_limit_address != 0) {
+    rlimit new_limit{};
+    if (!ReadTraceeMemory(
+            pid, new_limit_address, &new_limit, sizeof(new_limit))) {
+      SetEmulatedSyscallReturn(pid, state, regs, -EFAULT);
+      return true;
+    }
+    if (new_limit.rlim_cur > new_limit.rlim_max) {
+      SetEmulatedSyscallReturn(pid, state, regs, -EINVAL);
+      return true;
+    }
+    if (state->effective_uid != kRootUid &&
+        new_limit.rlim_max > old_limit.rlim_max) {
+      SetEmulatedSyscallReturn(pid, state, regs, -EPERM);
+      return true;
+    }
+    state->file_descriptor_limit = new_limit;
+  }
+
+  if (old_limit_address != 0 && !WriteTraceeMemory(pid, old_limit_address,
+                                    &old_limit, sizeof(old_limit))) {
+    state->file_descriptor_limit = old_limit;
+    SetEmulatedSyscallReturn(pid, state, regs, -EFAULT);
+    return true;
+  }
+
+  SetEmulatedSyscallReturn(pid, state, regs, 0);
+  return true;
+}
+
+void RewriteUnixCredentials(pid_t pid, uint64_t message_address, uid_t app_uid,
+    gid_t app_gid, const std::unordered_map<pid_t, TraceeState>& states,
+    bool to_kernel) {
+  msghdr message{};
+  if (message_address == 0 ||
+      !ReadTraceeMemory(pid, message_address, &message, sizeof(message)) ||
+      message.msg_control == nullptr || message.msg_controllen == 0 ||
+      message.msg_controllen > kMaxControlMessageSize) {
+    return;
+  }
+
+  const uint64_t control_address =
+      reinterpret_cast<uint64_t>(message.msg_control);
+  std::vector<uint8_t> control(message.msg_controllen);
+  if (!ReadTraceeMemory(pid, control_address, control.data(), control.size())) {
+    return;
+  }
+
+  bool   changed = false;
+  size_t offset  = 0;
+  while (offset + sizeof(cmsghdr) <= control.size()) {
+    cmsghdr header{};
+    memcpy(&header, control.data() + offset, sizeof(header));
+    if (header.cmsg_len < sizeof(cmsghdr) ||
+        header.cmsg_len > control.size() - offset) {
+      break;
+    }
+
+    if (header.cmsg_level == SOL_SOCKET &&
+        header.cmsg_type == SCM_CREDENTIALS &&
+        header.cmsg_len >= sizeof(cmsghdr) + sizeof(UnixCredentials)) {
+      UnixCredentials credentials{};
+      memcpy(&credentials, control.data() + offset + sizeof(cmsghdr),
+          sizeof(credentials));
+      if (to_kernel) {
+        credentials.uid = app_uid;
+        credentials.gid = app_gid;
+      } else {
+        const auto sender = states.find(credentials.pid);
+        if (sender != states.end()) {
+          credentials.uid = sender->second.effective_uid;
+          credentials.gid = sender->second.effective_gid;
+        } else {
+          if (credentials.uid == app_uid) {
+            credentials.uid = kRootUid;
+          }
+          if (credentials.gid == app_gid) {
+            credentials.gid = kRootGid;
+          }
+        }
+      }
+      memcpy(control.data() + offset + sizeof(cmsghdr), &credentials,
+          sizeof(credentials));
+      changed = true;
+    }
+
+    const size_t next =
+        (header.cmsg_len + sizeof(size_t) - 1U) & ~(sizeof(size_t) - 1U);
+    if (next == 0 || next > control.size() - offset) {
+      break;
+    }
+    offset += next;
+  }
+
+  if (changed) {
+    WriteTraceeMemory(pid, control_address, control.data(), control.size());
+  }
+}
+
 void ReplaceAppOwnership(struct stat* file_stat, uid_t app_uid, gid_t app_gid) {
   if (file_stat == nullptr) {
     return;
@@ -2333,6 +2480,12 @@ int TracerMain(const std::string& extract_dst_path,
   std::unordered_set<pid_t>              tracked_pids;
 
   TraceeState initial_state;
+  if (getrlimit(RLIMIT_NOFILE, &initial_state.file_descriptor_limit) != 0) {
+    initial_state.file_descriptor_limit = {
+        .rlim_cur = 1024,
+        .rlim_max = 1024,
+    };
+  }
   if (!initial_executable_path.empty()) {
     initial_state.executable_path =
         ResolveVirtualExecutablePath(normalized_rootfs,
@@ -2410,11 +2563,21 @@ int TracerMain(const std::string& extract_dst_path,
       if (GetRegs(pid, &regs)) {
         if (!is_syscall_entry) {
           TrackEmulatedNetworkNamespaceFd(&state, regs);
+          if (regs.regs[8] == kSysSendmsg ||
+              (regs.regs[8] == kSysRecvmsg &&
+                  static_cast<int64_t>(regs.regs[0]) >= 0)) {
+            RewriteUnixCredentials(
+                pid, regs.regs[1], app_uid, app_gid, states, false);
+          }
         }
         if (is_syscall_entry || !syscall_direction_known) {
           RewriteSockaddrIfNeeded(pid, normalized_rootfs, &regs);
         }
         if (is_syscall_entry) {
+          if (regs.regs[8] == kSysSendmsg) {
+            RewriteUnixCredentials(
+                pid, regs.regs[1], app_uid, app_gid, states, true);
+          }
           RedirectUserNamespaceControlFile(
               pid, normalized_rootfs, state, &regs);
           if (!MaybeEmulateNamespaceSyscall(pid, &state, &regs) &&
@@ -2425,6 +2588,7 @@ int TracerMain(const std::string& extract_dst_path,
               !MaybeEmulateProcSelfReadlink(
                   pid, normalized_rootfs, &state, &regs) &&
               !MaybeEmulatePrctlSyscall(pid, &state, &regs) &&
+              !MaybeEmulateFileDescriptorLimit(pid, &state, &regs) &&
               !MaybeEmulateUidGidSyscall(pid, &state, &regs) &&
               !MaybeEmulateUnavailableAuditSocket(pid, &state, &regs) &&
               !MaybeEmulateShadowLockSyscall(
