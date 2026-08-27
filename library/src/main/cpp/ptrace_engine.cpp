@@ -6,7 +6,9 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <limits.h>
+#include <linux/netlink.h>
 #include <linux/ptrace.h>
+#include <linux/sched.h>
 #include <linux/stat.h>
 #include <signal.h>
 #include <stddef.h>
@@ -37,93 +39,106 @@
 
 namespace {
 
-constexpr const char* kLogTag                  = "andlify-ptrace";
-constexpr uint64_t    kSysSetxattr             = 5;
-constexpr uint64_t    kSysLsetxattr            = 6;
-constexpr uint64_t    kSysGetxattr             = 8;
-constexpr uint64_t    kSysLgetxattr            = 9;
-constexpr uint64_t    kSysListxattr            = 11;
-constexpr uint64_t    kSysLlistxattr           = 12;
-constexpr uint64_t    kSysRemovexattr          = 14;
-constexpr uint64_t    kSysLremovexattr         = 15;
-constexpr uint64_t    kSysMknodat              = 33;
-constexpr uint64_t    kSysMkdirat              = 34;
-constexpr uint64_t    kSysUnlinkat             = 35;
-constexpr uint64_t    kSysSymlinkat            = 36;
-constexpr uint64_t    kSysLinkat               = 37;
-constexpr uint64_t    kSysRenameat             = 38;
-constexpr uint64_t    kSysStatfs               = 43;
-constexpr uint64_t    kSysFaccessat            = 48;
-constexpr uint64_t    kSysChdir                = 49;
-constexpr uint64_t    kSysFchmodat             = 53;
-constexpr uint64_t    kSysFchownat             = 54;
-constexpr uint64_t    kSysFchown               = 55;
-constexpr uint64_t    kSysOpenat               = 56;
-constexpr uint64_t    kSysReadlinkat           = 78;
-constexpr uint64_t    kSysNewfstatat           = 79;
-constexpr uint64_t    kSysFstat                = 80;
-constexpr uint64_t    kSysUtimensat            = 88;
-constexpr uint64_t    kSysRenameat2            = 276;
-constexpr uint64_t    kSysStatx                = 291;
-constexpr uint64_t    kSysOpenat2              = 437;
-constexpr uint64_t    kSysFaccessat2           = 439;
-constexpr uint64_t    kSysExecve               = 221;
-constexpr uint64_t    kSysCapset               = 91;
-constexpr uint64_t    kSysSocket               = 198;
-constexpr uint64_t    kSysBind                 = 200;
-constexpr uint64_t    kSysAccept               = 202;
-constexpr uint64_t    kSysConnect              = 203;
-constexpr uint64_t    kSysSendto               = 206;
-constexpr uint64_t    kSysAccept4              = 242;
-constexpr uint64_t    kSysSetregid             = 143;
-constexpr uint64_t    kSysSetgid               = 144;
-constexpr uint64_t    kSysSetreuid             = 145;
-constexpr uint64_t    kSysSetuid               = 146;
-constexpr uint64_t    kSysSetresuid            = 147;
-constexpr uint64_t    kSysGetresuid            = 148;
-constexpr uint64_t    kSysSetresgid            = 149;
-constexpr uint64_t    kSysGetresgid            = 150;
-constexpr uint64_t    kSysSetfsuid             = 151;
-constexpr uint64_t    kSysSetfsgid             = 152;
-constexpr uint64_t    kSysGetgroups            = 158;
-constexpr uint64_t    kSysSetgroups            = 159;
-constexpr uint64_t    kSysPrctl                = 167;
-constexpr uint64_t    kSysGetpid               = 172;
-constexpr uint64_t    kSysGetuid               = 174;
-constexpr uint64_t    kSysGeteuid              = 175;
-constexpr uint64_t    kSysGetgid               = 176;
-constexpr uint64_t    kSysGetegid              = 177;
-constexpr uint64_t    kSysIoctl                = 29;
-constexpr uint64_t    kSysGetcwd               = 17;
-constexpr uint64_t    kTcgets                  = 0x5401;
-constexpr uint64_t    kTcsets                  = 0x5402;
-constexpr uint64_t    kTcsetsw                 = 0x5403;
-constexpr uint64_t    kTcsetsf                 = 0x5404;
-constexpr uint64_t    kTcgets2                 = 0x802c542A;
-constexpr uint64_t    kTcsets2                 = 0x402c542B;
-constexpr uint64_t    kTcsetsw2                = 0x402c542C;
-constexpr uint64_t    kTcsetsf2                = 0x402c542D;
-constexpr uint64_t    kTiocgpgrp               = 0x540F;
-constexpr uint64_t    kTiocspgrp               = 0x5410;
-constexpr uint64_t    kTiocgwinsz              = 0x5413;
-constexpr size_t      kPathReadLimit           = 4096;
-constexpr uint64_t    kStackScratchOffset      = 0x800;
-constexpr uint64_t    kExecScratchSize         = 0x2000;
-constexpr size_t      kMaxSymlinkDepth         = 40;
-constexpr uint64_t    kRootUid                 = 0;
-constexpr uint64_t    kRootGid                 = 0;
-constexpr uint64_t    kAfUnix                  = 1;
-constexpr uint64_t    kAfInet                  = 2;
-constexpr uint64_t    kAfInet6                 = 10;
-constexpr uint64_t    kAfNetlink               = 16;
-constexpr uint64_t    kSockDgram               = 2;
-constexpr uint64_t    kSockRaw                 = 3;
-constexpr uint64_t    kSockTypeMask            = 0xf;
-constexpr uint64_t    kIpProtoIcmp             = 1;
-constexpr uint64_t    kIpProtoIcmpv6           = 58;
-constexpr uint64_t    kNetlinkAudit            = 9;
-constexpr uint32_t    kUnchangedId             = UINT32_MAX;
-constexpr uint64_t    kMaxSupplementaryGroups  = 65536;
+constexpr const char* kLogTag                 = "andlify-ptrace";
+constexpr uint64_t    kSysSetxattr            = 5;
+constexpr uint64_t    kSysLsetxattr           = 6;
+constexpr uint64_t    kSysGetxattr            = 8;
+constexpr uint64_t    kSysLgetxattr           = 9;
+constexpr uint64_t    kSysListxattr           = 11;
+constexpr uint64_t    kSysLlistxattr          = 12;
+constexpr uint64_t    kSysRemovexattr         = 14;
+constexpr uint64_t    kSysLremovexattr        = 15;
+constexpr uint64_t    kSysMknodat             = 33;
+constexpr uint64_t    kSysEventfd2            = 19;
+constexpr uint64_t    kSysClose               = 57;
+constexpr uint64_t    kSysUmount2             = 39;
+constexpr uint64_t    kSysMount               = 40;
+constexpr uint64_t    kSysPivotRoot           = 41;
+constexpr uint64_t    kSysMkdirat             = 34;
+constexpr uint64_t    kSysUnlinkat            = 35;
+constexpr uint64_t    kSysSymlinkat           = 36;
+constexpr uint64_t    kSysLinkat              = 37;
+constexpr uint64_t    kSysRenameat            = 38;
+constexpr uint64_t    kSysStatfs              = 43;
+constexpr uint64_t    kSysFaccessat           = 48;
+constexpr uint64_t    kSysChdir               = 49;
+constexpr uint64_t    kSysFchmodat            = 53;
+constexpr uint64_t    kSysFchownat            = 54;
+constexpr uint64_t    kSysFchown              = 55;
+constexpr uint64_t    kSysOpenat              = 56;
+constexpr uint64_t    kSysReadlinkat          = 78;
+constexpr uint64_t    kSysNewfstatat          = 79;
+constexpr uint64_t    kSysFstat               = 80;
+constexpr uint64_t    kSysUtimensat           = 88;
+constexpr uint64_t    kSysRenameat2           = 276;
+constexpr uint64_t    kSysStatx               = 291;
+constexpr uint64_t    kSysOpenat2             = 437;
+constexpr uint64_t    kSysFaccessat2          = 439;
+constexpr uint64_t    kSysExecve              = 221;
+constexpr uint64_t    kSysCapset              = 91;
+constexpr uint64_t    kSysSocket              = 198;
+constexpr uint64_t    kSysBind                = 200;
+constexpr uint64_t    kSysAccept              = 202;
+constexpr uint64_t    kSysConnect             = 203;
+constexpr uint64_t    kSysSendto              = 206;
+constexpr uint64_t    kSysRecvfrom            = 207;
+constexpr uint64_t    kSysAccept4             = 242;
+constexpr uint64_t    kSysSetregid            = 143;
+constexpr uint64_t    kSysSetgid              = 144;
+constexpr uint64_t    kSysSetreuid            = 145;
+constexpr uint64_t    kSysSetuid              = 146;
+constexpr uint64_t    kSysSetresuid           = 147;
+constexpr uint64_t    kSysGetresuid           = 148;
+constexpr uint64_t    kSysSetresgid           = 149;
+constexpr uint64_t    kSysGetresgid           = 150;
+constexpr uint64_t    kSysSetfsuid            = 151;
+constexpr uint64_t    kSysSetfsgid            = 152;
+constexpr uint64_t    kSysGetgroups           = 158;
+constexpr uint64_t    kSysSetgroups           = 159;
+constexpr uint64_t    kSysPrctl               = 167;
+constexpr uint64_t    kSysClone               = 220;
+constexpr uint64_t    kSysUnshare             = 97;
+constexpr uint64_t    kSysClone3              = 435;
+constexpr uint64_t    kSysGetpid              = 172;
+constexpr uint64_t    kSysGetuid              = 174;
+constexpr uint64_t    kSysGeteuid             = 175;
+constexpr uint64_t    kSysGetgid              = 176;
+constexpr uint64_t    kSysGetegid             = 177;
+constexpr uint64_t    kSysIoctl               = 29;
+constexpr uint64_t    kSysGetcwd              = 17;
+constexpr uint64_t    kTcgets                 = 0x5401;
+constexpr uint64_t    kTcsets                 = 0x5402;
+constexpr uint64_t    kTcsetsw                = 0x5403;
+constexpr uint64_t    kTcsetsf                = 0x5404;
+constexpr uint64_t    kTcgets2                = 0x802c542A;
+constexpr uint64_t    kTcsets2                = 0x402c542B;
+constexpr uint64_t    kTcsetsw2               = 0x402c542C;
+constexpr uint64_t    kTcsetsf2               = 0x402c542D;
+constexpr uint64_t    kTiocgpgrp              = 0x540F;
+constexpr uint64_t    kTiocspgrp              = 0x5410;
+constexpr uint64_t    kTiocgwinsz             = 0x5413;
+constexpr size_t      kPathReadLimit          = 4096;
+constexpr uint64_t    kStackScratchOffset     = 0x800;
+constexpr uint64_t    kExecScratchSize        = 0x2000;
+constexpr size_t      kMaxSymlinkDepth        = 40;
+constexpr uint64_t    kRootUid                = 0;
+constexpr uint64_t    kRootGid                = 0;
+constexpr uint64_t    kAfUnix                 = 1;
+constexpr uint64_t    kAfInet                 = 2;
+constexpr uint64_t    kAfInet6                = 10;
+constexpr uint64_t    kAfNetlink              = 16;
+constexpr uint64_t    kSockDgram              = 2;
+constexpr uint64_t    kSockRaw                = 3;
+constexpr uint64_t    kSockTypeMask           = 0xf;
+constexpr uint64_t    kIpProtoIcmp            = 1;
+constexpr uint64_t    kIpProtoIcmpv6          = 58;
+constexpr uint64_t    kNetlinkAudit           = 9;
+constexpr uint64_t    kNetlinkRoute           = 0;
+constexpr uint32_t    kUnchangedId            = UINT32_MAX;
+constexpr uint64_t    kMaxSupplementaryGroups = 65536;
+constexpr uint64_t    kNamespaceCloneFlags =
+    CLONE_NEWCGROUP | CLONE_NEWIPC | CLONE_NEWNET | CLONE_NEWNS | CLONE_NEWPID |
+    CLONE_NEWUSER | CLONE_NEWUTS;
 constexpr const char* kDefaultEnvironment[][2] = {
     {"PATH",    "/usr/bin:/bin:/usr/sbin:/sbin"},
     {"HOME",    "/root"                        },
@@ -137,22 +152,28 @@ constexpr const char* kDefaultEnvironment[][2] = {
 constexpr char kInotifyMaxUserWatchesValue[] = "8192\n";
 
 struct TraceeState {
-  bool                            expect_entry        = true;
-  bool                            options_applied     = false;
-  bool                            has_emulated_return = false;
-  uint64_t                        emulated_return     = 0;
-  std::string                     executable_path;
-  std::string                     pending_executable_path;
-  uint32_t                        real_uid      = kRootUid;
-  uint32_t                        effective_uid = kRootUid;
-  uint32_t                        saved_uid     = kRootUid;
-  uint32_t                        fs_uid        = kRootUid;
-  uint32_t                        real_gid      = kRootGid;
-  uint32_t                        effective_gid = kRootGid;
-  uint32_t                        saved_gid     = kRootGid;
-  uint32_t                        fs_gid        = kRootGid;
-  std::vector<uint32_t>           supplementary_groups{kRootGid};
-  std::unordered_set<std::string> copied_lock_sources;
+  bool                              expect_entry               = true;
+  bool                              options_applied            = false;
+  bool                              has_emulated_return        = false;
+  bool                              emulated_mount_namespace   = false;
+  bool                              emulated_network_namespace = false;
+  bool                              emulated_user_namespace    = false;
+  bool                              pending_netlink_route_fd   = false;
+  uint64_t                          emulated_return            = 0;
+  std::string                       executable_path;
+  std::string                       pending_executable_path;
+  std::string                       emulated_old_root;
+  uint32_t                          real_uid      = kRootUid;
+  uint32_t                          effective_uid = kRootUid;
+  uint32_t                          saved_uid     = kRootUid;
+  uint32_t                          fs_uid        = kRootUid;
+  uint32_t                          real_gid      = kRootGid;
+  uint32_t                          effective_gid = kRootGid;
+  uint32_t                          saved_gid     = kRootGid;
+  uint32_t                          fs_gid        = kRootGid;
+  std::vector<uint32_t>             supplementary_groups{kRootGid};
+  std::unordered_set<std::string>   copied_lock_sources;
+  std::unordered_map<int, uint32_t> emulated_netlink_route_fds;
 };
 
 struct ExecPlan {
@@ -848,6 +869,252 @@ void SetEmulatedSyscallReturn(
 
   state->has_emulated_return = true;
   state->emulated_return     = static_cast<uint64_t>(return_value);
+}
+
+bool MaybeEmulateNamespaceSyscall(
+    pid_t pid, TraceeState* state, user_pt_regs* regs) {
+  if (state == nullptr || regs == nullptr) {
+    return false;
+  }
+
+  if (regs->regs[8] == kSysUnshare) {
+    const uint64_t namespace_flags = regs->regs[0] & kNamespaceCloneFlags;
+    if (namespace_flags == 0) {
+      return false;
+    }
+
+    state->emulated_mount_namespace |= (namespace_flags & CLONE_NEWNS) != 0;
+    state->emulated_network_namespace |= (namespace_flags & CLONE_NEWNET) != 0;
+    state->emulated_user_namespace |= (namespace_flags & CLONE_NEWUSER) != 0;
+    regs->regs[0] &= ~kNamespaceCloneFlags;
+    if (regs->regs[0] == 0) {
+      SetEmulatedSyscallReturn(pid, state, regs, 0);
+      return true;
+    }
+    SetRegs(pid, *regs);
+    return false;
+  }
+
+  if (regs->regs[8] == kSysClone) {
+    const uint64_t namespace_flags = regs->regs[0] & kNamespaceCloneFlags;
+    if (namespace_flags == 0) {
+      return false;
+    }
+
+    state->emulated_mount_namespace |= (namespace_flags & CLONE_NEWNS) != 0;
+    state->emulated_network_namespace |= (namespace_flags & CLONE_NEWNET) != 0;
+    state->emulated_user_namespace |= (namespace_flags & CLONE_NEWUSER) != 0;
+    regs->regs[0] &= ~kNamespaceCloneFlags;
+    SetRegs(pid, *regs);
+    return false;
+  }
+
+  if (regs->regs[8] != kSysClone3 || regs->regs[0] == 0 ||
+      regs->regs[1] < sizeof(uint64_t)) {
+    return false;
+  }
+
+  uint64_t flags = 0;
+  if (!ReadTraceeMemory(pid, regs->regs[0], &flags, sizeof(flags))) {
+    return false;
+  }
+  const uint64_t namespace_flags = flags & kNamespaceCloneFlags;
+  if (namespace_flags == 0) {
+    return false;
+  }
+
+  state->emulated_mount_namespace |= (namespace_flags & CLONE_NEWNS) != 0;
+  state->emulated_network_namespace |= (namespace_flags & CLONE_NEWNET) != 0;
+  state->emulated_user_namespace |= (namespace_flags & CLONE_NEWUSER) != 0;
+  flags &= ~kNamespaceCloneFlags;
+  WriteTraceeMemory(pid, regs->regs[0], &flags, sizeof(flags));
+  return false;
+}
+
+bool MaybeEmulateMountNamespaceOperation(pid_t pid,
+    const std::string& normalized_rootfs, TraceeState* state,
+    user_pt_regs* regs) {
+  if (state == nullptr || regs == nullptr || !state->emulated_mount_namespace) {
+    return false;
+  }
+
+  switch (regs->regs[8]) {
+    case kSysMount:
+    case kSysUmount2:
+      SetEmulatedSyscallReturn(pid, state, regs, 0);
+      return true;
+    case kSysPivotRoot: {
+      std::string new_root;
+      std::string old_root;
+      if (!ReadTraceeCString(pid, regs->regs[0], kPathReadLimit, &new_root) ||
+          !ReadTraceeCString(pid, regs->regs[1], kPathReadLimit, &old_root)) {
+        SetEmulatedSyscallReturn(pid, state, regs, -EFAULT);
+        return true;
+      }
+
+      std::string cwd;
+      if ((!IsAbsoluteUnixPath(new_root) || !IsAbsoluteUnixPath(old_root)) &&
+          !ResolveVirtualPathBase(pid, AT_FDCWD, normalized_rootfs, &cwd)) {
+        SetEmulatedSyscallReturn(pid, state, regs, -ENOENT);
+        return true;
+      }
+      if (!IsAbsoluteUnixPath(new_root)) {
+        new_root = ResolveVirtualRelativePath(cwd, new_root);
+      }
+      if (!IsAbsoluteUnixPath(old_root)) {
+        old_root = ResolveVirtualRelativePath(cwd, old_root);
+      }
+      if (old_root.rfind(new_root, 0) != 0 ||
+          (old_root.size() > new_root.size() &&
+              old_root[new_root.size()] != '/')) {
+        SetEmulatedSyscallReturn(pid, state, regs, -EINVAL);
+        return true;
+      }
+
+      state->emulated_old_root = old_root.substr(new_root.size());
+      if (state->emulated_old_root.empty()) {
+        state->emulated_old_root = "/";
+      }
+      SetEmulatedSyscallReturn(pid, state, regs, 0);
+      return true;
+    }
+    default:
+      return false;
+  }
+}
+
+bool MaybeEmulateNetworkNamespaceOperation(
+    pid_t pid, TraceeState* state, user_pt_regs* regs) {
+  if (state == nullptr || regs == nullptr ||
+      !state->emulated_network_namespace) {
+    return false;
+  }
+
+  if (regs->regs[8] == kSysSocket && regs->regs[0] == kAfNetlink &&
+      regs->regs[2] == kNetlinkRoute) {
+    regs->regs[0] = 1;
+    regs->regs[1] = O_CLOEXEC | O_NONBLOCK;
+    if (!SetSyscallNumber(pid, regs, kSysEventfd2)) {
+      return false;
+    }
+    state->pending_netlink_route_fd = true;
+    return true;
+  }
+
+  const int fd       = static_cast<int>(regs->regs[0]);
+  auto      route_fd = state->emulated_netlink_route_fds.find(fd);
+  if (route_fd == state->emulated_netlink_route_fds.end()) {
+    return false;
+  }
+
+  switch (regs->regs[8]) {
+    case kSysBind:
+      SetEmulatedSyscallReturn(pid, state, regs, 0);
+      return true;
+    case kSysSendto: {
+      nlmsghdr     header{};
+      const size_t length = static_cast<size_t>(regs->regs[2]);
+      if (length < sizeof(header) ||
+          !ReadTraceeMemory(pid, regs->regs[1], &header, sizeof(header))) {
+        SetEmulatedSyscallReturn(pid, state, regs, -EFAULT);
+        return true;
+      }
+      route_fd->second = header.nlmsg_seq;
+      SetEmulatedSyscallReturn(pid, state, regs, length);
+      return true;
+    }
+    case kSysRecvfrom: {
+      struct {
+        nlmsghdr header;
+        int32_t  error;
+      } response{};
+      response.header.nlmsg_len  = sizeof(response);
+      response.header.nlmsg_type = NLMSG_ERROR;
+      response.header.nlmsg_seq  = route_fd->second;
+      response.header.nlmsg_pid  = pid;
+      const size_t length =
+          std::min(static_cast<size_t>(regs->regs[2]), sizeof(response));
+      if (regs->regs[1] == 0 ||
+          !WriteTraceeMemory(pid, regs->regs[1], &response, length)) {
+        SetEmulatedSyscallReturn(pid, state, regs, -EFAULT);
+        return true;
+      }
+      SetEmulatedSyscallReturn(pid, state, regs, length);
+      return true;
+    }
+    case kSysClose:
+      state->emulated_netlink_route_fds.erase(route_fd);
+      return false;
+    default:
+      return false;
+  }
+}
+
+void TrackEmulatedNetworkNamespaceFd(
+    TraceeState* state, const user_pt_regs& regs) {
+  if (state == nullptr || !state->pending_netlink_route_fd) {
+    return;
+  }
+
+  state->pending_netlink_route_fd = false;
+  const int64_t fd                = static_cast<int64_t>(regs.regs[0]);
+  if (fd >= 0 && fd <= INT_MAX) {
+    state->emulated_netlink_route_fds.emplace(static_cast<int>(fd), 0);
+  }
+}
+
+void RedirectUserNamespaceControlFile(pid_t pid,
+    const std::string& normalized_rootfs, const TraceeState& state,
+    user_pt_regs* regs) {
+  if (regs == nullptr || !state.emulated_user_namespace ||
+      regs->regs[8] != kSysOpenat || regs->regs[1] == 0) {
+    return;
+  }
+
+  std::string path;
+  if (!ReadTraceeCString(pid, regs->regs[1], kPathReadLimit, &path) ||
+      path.empty()) {
+    return;
+  }
+  if (!IsAbsoluteUnixPath(path)) {
+    std::string base_path;
+    if (!ResolveVirtualPathBase(pid, static_cast<int>(regs->regs[0]),
+            normalized_rootfs, &base_path)) {
+      return;
+    }
+    path = ResolveVirtualRelativePath(base_path, path);
+  }
+
+  constexpr std::string_view proc_prefix = "/proc/";
+  if (path.rfind(proc_prefix, 0) != 0) {
+    return;
+  }
+  const size_t separator = path.find('/', proc_prefix.size());
+  if (separator == std::string::npos) {
+    return;
+  }
+  const std::string_view process = std::string_view(path).substr(
+      proc_prefix.size(), separator - proc_prefix.size());
+  if (process.empty() ||
+      (process != "self" && process != "thread-self" &&
+          !std::all_of(process.begin(), process.end(), [](char value) {
+            return value >= '0' && value <= '9';
+          }))) {
+    return;
+  }
+  const std::string_view file = std::string_view(path).substr(separator + 1);
+  if (file != "uid_map" && file != "gid_map" && file != "setgroups") {
+    return;
+  }
+
+  constexpr char target[] = "/dev/null";
+  if (regs->sp <= kStackScratchOffset ||
+      !WriteTraceeMemory(
+          pid, regs->sp - kStackScratchOffset, target, sizeof(target))) {
+    return;
+  }
+  regs->regs[1] = regs->sp - kStackScratchOffset;
+  SetRegs(pid, *regs);
 }
 
 bool MaybeEmulateGetcwd(pid_t pid, const std::string& normalized_rootfs,
@@ -1571,8 +1838,8 @@ bool ApplyEmulatedSyscallReturn(pid_t pid, TraceeState* state) {
 }
 
 void RewritePathArgument(pid_t pid, const std::string& normalized_rootfs,
-    user_pt_regs* regs, int arg_index, int dir_fd_arg_index,
-    uint64_t scratch_offset) {
+    const TraceeState& state, user_pt_regs* regs, int arg_index,
+    int dir_fd_arg_index, uint64_t scratch_offset) {
   const uint64_t source_path_address = regs->regs[arg_index];
   if (source_path_address == 0) {
     return;
@@ -1597,6 +1864,15 @@ void RewritePathArgument(pid_t pid, const std::string& normalized_rootfs,
       base_path.push_back('/');
     }
     virtual_path = base_path + virtual_path;
+  }
+
+  if (!state.emulated_old_root.empty() &&
+      (virtual_path == state.emulated_old_root ||
+          virtual_path.rfind(state.emulated_old_root + "/", 0) == 0)) {
+    virtual_path = virtual_path.substr(state.emulated_old_root.size());
+    if (virtual_path.empty()) {
+      virtual_path = "/";
+    }
   }
 
   virtual_path = ResolveVirtualSymlinks(normalized_rootfs, virtual_path,
@@ -1632,8 +1908,9 @@ void RewritePathArgument(pid_t pid, const std::string& normalized_rootfs,
   }
 }
 
-void RewritePathArgumentsIfNeeded(
-    pid_t pid, const std::string& normalized_rootfs, user_pt_regs* regs) {
+void RewritePathArgumentsIfNeeded(pid_t pid,
+    const std::string& normalized_rootfs, const TraceeState& state,
+    user_pt_regs* regs) {
   const uint64_t syscall_number = regs->regs[8];
   switch (syscall_number) {
     case kSysSetxattr:
@@ -1648,7 +1925,7 @@ void RewritePathArgumentsIfNeeded(
     case kSysExecve:
     case kSysStatfs:
       RewritePathArgument(
-          pid, normalized_rootfs, regs, 0, -1, kStackScratchOffset);
+          pid, normalized_rootfs, state, regs, 0, -1, kStackScratchOffset);
       return;
     case kSysMknodat:
     case kSysMkdirat:
@@ -1664,19 +1941,19 @@ void RewritePathArgumentsIfNeeded(
     case kSysOpenat2:
     case kSysFaccessat2:
       RewritePathArgument(
-          pid, normalized_rootfs, regs, 1, 0, kStackScratchOffset);
+          pid, normalized_rootfs, state, regs, 1, 0, kStackScratchOffset);
       return;
     case kSysSymlinkat:
       RewritePathArgument(
-          pid, normalized_rootfs, regs, 2, 1, kStackScratchOffset);
+          pid, normalized_rootfs, state, regs, 2, 1, kStackScratchOffset);
       return;
     case kSysLinkat:
     case kSysRenameat:
     case kSysRenameat2:
       RewritePathArgument(
-          pid, normalized_rootfs, regs, 1, 0, kStackScratchOffset);
+          pid, normalized_rootfs, state, regs, 1, 0, kStackScratchOffset);
       RewritePathArgument(
-          pid, normalized_rootfs, regs, 3, 2, kStackScratchOffset * 2);
+          pid, normalized_rootfs, state, regs, 3, 2, kStackScratchOffset * 2);
       return;
     default:
       return;
@@ -2131,11 +2408,20 @@ int TracerMain(const std::string& extract_dst_path,
 
       user_pt_regs regs{};
       if (GetRegs(pid, &regs)) {
+        if (!is_syscall_entry) {
+          TrackEmulatedNetworkNamespaceFd(&state, regs);
+        }
         if (is_syscall_entry || !syscall_direction_known) {
           RewriteSockaddrIfNeeded(pid, normalized_rootfs, &regs);
         }
         if (is_syscall_entry) {
-          if (!MaybeEmulateGetcwd(pid, normalized_rootfs, &state, &regs) &&
+          RedirectUserNamespaceControlFile(
+              pid, normalized_rootfs, state, &regs);
+          if (!MaybeEmulateNamespaceSyscall(pid, &state, &regs) &&
+              !MaybeEmulateMountNamespaceOperation(
+                  pid, normalized_rootfs, &state, &regs) &&
+              !MaybeEmulateNetworkNamespaceOperation(pid, &state, &regs) &&
+              !MaybeEmulateGetcwd(pid, normalized_rootfs, &state, &regs) &&
               !MaybeEmulateProcSelfReadlink(
                   pid, normalized_rootfs, &state, &regs) &&
               !MaybeEmulatePrctlSyscall(pid, &state, &regs) &&
@@ -2150,7 +2436,8 @@ int TracerMain(const std::string& extract_dst_path,
                 RewriteExecveIfNeeded(pid, normalized_rootfs, &regs,
                     state.executable_path, &state.pending_executable_path);
             if (exec_rewrite_result == ExecRewriteResult::kNotApplicable) {
-              RewritePathArgumentsIfNeeded(pid, normalized_rootfs, &regs);
+              RewritePathArgumentsIfNeeded(
+                  pid, normalized_rootfs, state, &regs);
             }
           }
         } else {
