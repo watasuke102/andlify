@@ -2396,8 +2396,11 @@ void RewritePathArgument(pid_t pid, const std::string& normalized_rootfs,
     if (virtual_path.empty()) {
       virtual_path = "/";
     }
-  } else if (regs->regs[8] == kSysChdir && IsAbsoluteUnixPath(original_path) &&
-             !state.emulated_new_root.empty()) {
+  } else if (IsAbsoluteUnixPath(original_path) &&
+             !state.emulated_new_root.empty() &&
+             original_path != normalized_rootfs &&
+             original_path.rfind(normalized_rootfs + "/", 0) != 0 &&
+             !IsPassthroughUnixPath(original_path)) {
     virtual_path = state.emulated_new_root + virtual_path;
   }
 
