@@ -143,6 +143,7 @@ constexpr uint64_t    kIpProtoIcmpv6          = 58;
 constexpr uint64_t    kNetlinkAudit           = 9;
 constexpr uint64_t    kNetlinkRoute           = 0;
 constexpr uint32_t    kUnchangedId            = UINT32_MAX;
+constexpr uint64_t    kResolveNoMagiclinks    = 0x02;
 constexpr uint64_t    kResolveInRoot          = 0x10;
 constexpr uint64_t    kMaxSupplementaryGroups = 65536;
 constexpr size_t      kMaxControlMessageSize  = 65536;
@@ -170,7 +171,12 @@ struct TraceeState {
   bool                              emulated_network_namespace = false;
   bool                              emulated_user_namespace    = false;
   bool                              pending_netlink_route_fd   = false;
+  bool                              pending_openat2_retry      = false;
   uint64_t                          emulated_return            = 0;
+  uint64_t                          pending_openat_dirfd       = 0;
+  uint64_t                          pending_openat_path        = 0;
+  uint64_t                          pending_openat_flags       = 0;
+  uint64_t                          pending_openat_mode        = 0;
   std::string                       executable_path;
   std::string                       pending_executable_path;
   std::string                       pending_open_permission_path;
@@ -2428,17 +2434,18 @@ void RewritePathArgument(pid_t pid, const std::string& normalized_rootfs,
   }
 }
 
-void RewriteOpenat2IfNeeded(
-    pid_t pid, const std::string& normalized_rootfs, user_pt_regs* regs) {
-  if (regs == nullptr || regs->regs[8] != kSysOpenat2 ||
+void RewriteOpenat2IfNeeded(pid_t pid, const std::string& normalized_rootfs,
+    TraceeState* state, user_pt_regs* regs) {
+  if (state == nullptr || regs == nullptr || regs->regs[8] != kSysOpenat2 ||
       regs->regs[3] != sizeof(OpenHow)) {
     return;
   }
 
   OpenHow how{};
   if (!ReadTraceeMemory(pid, regs->regs[2], &how, sizeof(how)) ||
-      how.resolve != kResolveInRoot || how.flags > UINT32_MAX ||
-      how.mode > UINT32_MAX) {
+      (how.resolve & kResolveInRoot) == 0 ||
+      (how.resolve & ~(kResolveNoMagiclinks | kResolveInRoot)) != 0 ||
+      how.flags > UINT32_MAX || how.mode > UINT32_MAX) {
     return;
   }
 
@@ -2454,12 +2461,19 @@ void RewriteOpenat2IfNeeded(
   if (!IsAbsoluteUnixPath(path)) {
     path.insert(path.begin(), '/');
   }
-  const std::string resolution_root =
-      RewritePathToRootfs(normalized_rootfs, virtual_root);
-  const std::string resolved_path = ResolveVirtualSymlinks(
-      resolution_root, path, (how.flags & O_NOFOLLOW) == 0, false);
-  const std::string rewritten_path =
-      resolved_path == "/" ? resolution_root : resolution_root + resolved_path;
+  std::string rewritten_path;
+  if (virtual_root == "/") {
+    rewritten_path = RewritePathToRootfs(
+        normalized_rootfs, ResolveVirtualSymlinks(normalized_rootfs, path,
+                               (how.flags & O_NOFOLLOW) == 0));
+  } else {
+    const std::string resolution_root =
+        RewritePathToRootfs(normalized_rootfs, virtual_root);
+    const std::string resolved_path = ResolveVirtualSymlinks(
+        resolution_root, path, (how.flags & O_NOFOLLOW) == 0, false);
+    rewritten_path = resolved_path == "/" ? resolution_root :
+                                            resolution_root + resolved_path;
+  }
   const uint64_t scratch_address =
       regs->sp > kStackScratchOffset ? regs->sp - kStackScratchOffset : 0;
   if (scratch_address == 0 ||
@@ -2477,12 +2491,17 @@ void RewriteOpenat2IfNeeded(
         ANDROID_LOG_WARN, kLogTag, "Failed to rewrite openat2 for pid=%d", pid);
     return;
   }
+  state->pending_openat2_retry = true;
+  state->pending_openat_dirfd  = regs->regs[0];
+  state->pending_openat_path   = regs->regs[1];
+  state->pending_openat_flags  = regs->regs[2];
+  state->pending_openat_mode   = regs->regs[3];
   __android_log_print(ANDROID_LOG_VERBOSE, kLogTag,
       "rewrote openat2 to openat pid=%d path=%s", pid, rewritten_path.c_str());
 }
 
 void RewritePathArgumentsIfNeeded(pid_t pid,
-    const std::string& normalized_rootfs, const TraceeState& state,
+    const std::string& normalized_rootfs, TraceeState& state,
     user_pt_regs* regs) {
   const uint64_t syscall_number = regs->regs[8];
   switch (syscall_number) {
@@ -2516,7 +2535,7 @@ void RewritePathArgumentsIfNeeded(pid_t pid,
           pid, normalized_rootfs, state, regs, 1, 0, kStackScratchOffset);
       return;
     case kSysOpenat2:
-      RewriteOpenat2IfNeeded(pid, normalized_rootfs, regs);
+      RewriteOpenat2IfNeeded(pid, normalized_rootfs, &state, regs);
       return;
     case kSysSymlinkat:
       RewritePathArgument(
@@ -2720,6 +2739,29 @@ bool SuppressBlockedSyscall(pid_t pid, TraceeState* state) {
 
   const int blocked_syscall =
       has_siginfo ? siginfo.si_syscall : static_cast<int>(regs.regs[8]);
+  if (static_cast<uint64_t>(blocked_syscall) == kSysOpenat2 &&
+      state != nullptr && state->pending_openat2_retry && has_siginfo &&
+      siginfo.si_call_addr != nullptr) {
+    regs.regs[0] = state->pending_openat_dirfd;
+    regs.regs[1] = state->pending_openat_path;
+    regs.regs[2] = state->pending_openat_flags;
+    regs.regs[3] = state->pending_openat_mode;
+    regs.regs[8] = kSysOpenat;
+    regs.pc =
+        reinterpret_cast<uintptr_t>(siginfo.si_call_addr) - sizeof(uint32_t);
+    if (!SetRegs(pid, regs)) {
+      __android_log_print(
+          ANDROID_LOG_WARN, kLogTag, "Failed to retry openat for pid=%d", pid);
+      return false;
+    }
+    state->expect_entry          = true;
+    state->has_emulated_return   = false;
+    state->emulated_return       = 0;
+    state->pending_openat2_retry = false;
+    __android_log_print(ANDROID_LOG_VERBOSE, kLogTag,
+        "retrying blocked openat2 as openat pid=%d", pid);
+    return true;
+  }
   const bool is_emulated_syscall =
       static_cast<uint64_t>(blocked_syscall) == kSysGetpid &&
       state != nullptr && state->has_emulated_return;
@@ -3023,6 +3065,7 @@ int TracerMain(const std::string& extract_dst_path,
           RewriteSockaddrIfNeeded(pid, normalized_rootfs, &regs);
         }
         if (is_syscall_entry) {
+          state.pending_openat2_retry = false;
           if (regs.regs[8] == kSysSendmsg) {
             RewriteUnixCredentials(
                 pid, regs.regs[1], app_uid, app_gid, states, true);
@@ -3072,11 +3115,12 @@ int TracerMain(const std::string& extract_dst_path,
         if (ptrace(PTRACE_GETEVENTMSG, pid, nullptr, &new_pid) == 0 &&
             new_pid > 0) {
           tracked_pids.insert(static_cast<pid_t>(new_pid));
-          TraceeState child_state         = state;
-          child_state.expect_entry        = true;
-          child_state.options_applied     = false;
-          child_state.has_emulated_return = false;
-          child_state.emulated_return     = 0;
+          TraceeState child_state           = state;
+          child_state.expect_entry          = true;
+          child_state.options_applied       = false;
+          child_state.has_emulated_return   = false;
+          child_state.emulated_return       = 0;
+          child_state.pending_openat2_retry = false;
           child_state.emulated_mountinfo_path.clear();
           child_state.pending_open_permission_path.clear();
           child_state.pending_open_permission_mode = 0;
