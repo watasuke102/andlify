@@ -173,6 +173,7 @@ struct TraceeState {
   std::string                       executable_path;
   std::string                       pending_executable_path;
   std::string                       pending_open_permission_path;
+  std::string                       emulated_new_root;
   std::string                       emulated_old_root;
   std::string                       emulated_mountinfo_path;
   mode_t                            pending_open_permission_mode = 0;
@@ -1187,6 +1188,7 @@ bool MaybeEmulateMountNamespaceOperation(pid_t pid,
       if (state->emulated_old_root.empty()) {
         state->emulated_old_root = "/";
       }
+      state->emulated_new_root = new_root;
       SetEmulatedSyscallReturn(pid, state, regs, 0);
       return true;
     }
@@ -1472,6 +1474,14 @@ bool MaybeEmulateGetcwd(pid_t pid, const std::string& normalized_rootfs,
   if (!ResolveVirtualPathBase(
           pid, AT_FDCWD, normalized_rootfs, &virtual_path)) {
     return false;
+  }
+  if (!state->emulated_new_root.empty() &&
+      (virtual_path == state->emulated_new_root ||
+          virtual_path.rfind(state->emulated_new_root + "/", 0) == 0)) {
+    virtual_path = virtual_path.substr(state->emulated_new_root.size());
+    if (virtual_path.empty()) {
+      virtual_path = "/";
+    }
   }
 
   const size_t result_size = virtual_path.size() + 1;
@@ -2373,6 +2383,9 @@ void RewritePathArgument(pid_t pid, const std::string& normalized_rootfs,
     if (virtual_path.empty()) {
       virtual_path = "/";
     }
+  } else if (regs->regs[8] == kSysChdir && IsAbsoluteUnixPath(original_path) &&
+             !state.emulated_new_root.empty()) {
+    virtual_path = state.emulated_new_root + virtual_path;
   }
 
   virtual_path = ResolveVirtualSymlinks(normalized_rootfs, virtual_path,
