@@ -17,6 +17,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/file.h>
+#include <sys/mount.h>
 #include <sys/prctl.h>
 #include <sys/ptrace.h>
 #include <sys/resource.h>
@@ -164,41 +165,73 @@ constexpr char kInotifyMaxUserWatchesValue[] = "8192\n";
 constexpr char kOverflowIdValue[]            = "65534\n";
 
 struct TraceeState {
-  bool                              expect_entry               = true;
-  bool                              options_applied            = false;
-  bool                              has_emulated_return        = false;
-  bool                              emulated_mount_namespace   = false;
-  bool                              emulated_network_namespace = false;
-  bool                              emulated_user_namespace    = false;
-  bool                              pending_netlink_route_fd   = false;
-  bool                              pending_openat2_retry      = false;
-  uint64_t                          emulated_return            = 0;
-  uint64_t                          pending_openat_dirfd       = 0;
-  uint64_t                          pending_openat_path        = 0;
-  uint64_t                          pending_openat_flags       = 0;
-  uint64_t                          pending_openat_mode        = 0;
-  std::string                       executable_path;
-  std::string                       pending_executable_path;
-  std::string                       pending_open_permission_path;
-  std::string                       emulated_new_root;
-  std::string                       emulated_old_root;
-  std::string                       emulated_mountinfo_path;
-  mode_t                            pending_open_permission_mode = 0;
-  uint32_t                          real_uid                     = kRootUid;
-  uint32_t                          effective_uid                = kRootUid;
-  uint32_t                          saved_uid                    = kRootUid;
-  uint32_t                          fs_uid                       = kRootUid;
-  uint32_t                          real_gid                     = kRootGid;
-  uint32_t                          effective_gid                = kRootGid;
-  uint32_t                          saved_gid                    = kRootGid;
-  uint32_t                          fs_gid                       = kRootGid;
-  std::vector<uint32_t>             supplementary_groups{kRootGid};
-  std::unordered_set<std::string>   copied_lock_sources;
-  std::unordered_set<std::string>   emulated_mount_nodes;
-  std::unordered_set<std::string>   emulated_mount_points{"/"};
-  std::unordered_map<int, uint32_t> emulated_netlink_route_fds;
-  rlimit                            file_descriptor_limit{};
+  bool                            expect_entry               = true;
+  bool                            options_applied            = false;
+  bool                            has_emulated_return        = false;
+  bool                            emulated_mount_namespace   = false;
+  bool                            emulated_network_namespace = false;
+  bool                            emulated_user_namespace    = false;
+  bool                            pending_netlink_route_fd   = false;
+  bool                            pending_openat2_retry      = false;
+  uint64_t                        emulated_return            = 0;
+  uint64_t                        pending_openat_dirfd       = 0;
+  uint64_t                        pending_openat_path        = 0;
+  uint64_t                        pending_openat_flags       = 0;
+  uint64_t                        pending_openat_mode        = 0;
+  std::string                     executable_path;
+  std::string                     pending_executable_path;
+  std::string                     pending_open_permission_path;
+  std::string                     emulated_new_root;
+  std::string                     emulated_old_root;
+  std::string                     emulated_mountinfo_path;
+  mode_t                          pending_open_permission_mode = 0;
+  uint32_t                        real_uid                     = kRootUid;
+  uint32_t                        effective_uid                = kRootUid;
+  uint32_t                        saved_uid                    = kRootUid;
+  uint32_t                        fs_uid                       = kRootUid;
+  uint32_t                        real_gid                     = kRootGid;
+  uint32_t                        effective_gid                = kRootGid;
+  uint32_t                        saved_gid                    = kRootGid;
+  uint32_t                        fs_gid                       = kRootGid;
+  std::vector<uint32_t>           supplementary_groups{kRootGid};
+  std::unordered_set<std::string> copied_lock_sources;
+  std::unordered_set<std::string> emulated_mount_nodes;
+  std::unordered_set<std::string> emulated_mount_points{"/"};
+  std::unordered_map<std::string, std::string> emulated_bind_mounts;
+  std::unordered_map<int, uint32_t>            emulated_netlink_route_fds;
+  rlimit                                       file_descriptor_limit{};
 };
+
+std::string ResolveEmulatedBindMounts(
+    const TraceeState& state, const std::string& path) {
+  std::string resolved_path = path;
+  for (size_t depth = 0; depth <= state.emulated_bind_mounts.size(); ++depth) {
+    const std::pair<const std::string, std::string>* best_match = nullptr;
+    for (const auto& mount : state.emulated_bind_mounts) {
+      if (resolved_path != mount.first &&
+          resolved_path.rfind(mount.first + "/", 0) != 0) {
+        continue;
+      }
+      if (best_match == nullptr ||
+          mount.first.size() > best_match->first.size()) {
+        best_match = &mount;
+      }
+    }
+    if (best_match == nullptr) {
+      return resolved_path;
+    }
+
+    const std::string suffix = resolved_path.substr(best_match->first.size());
+    const std::string next_path = best_match->second == "/" ?
+                                      (suffix.empty() ? "/" : suffix) :
+                                      best_match->second + suffix;
+    if (next_path == resolved_path) {
+      return resolved_path;
+    }
+    resolved_path = next_path;
+  }
+  return resolved_path;
+}
 
 struct UnixCredentials {
   int32_t  pid;
@@ -1114,57 +1147,70 @@ bool MaybeEmulateMountNamespaceOperation(pid_t pid,
       return false;
     }
     case kSysMount: {
-      std::string destination;
-      if (ReadTraceeCString(pid, regs->regs[1], kPathReadLimit, &destination) &&
-          !destination.empty()) {
-        if (!state->emulated_old_root.empty() &&
-            (destination == state->emulated_old_root ||
-                destination.rfind(state->emulated_old_root + "/", 0) == 0)) {
-          destination = destination.substr(state->emulated_old_root.size());
-          if (destination.empty()) {
-            destination = "/";
-          }
+      constexpr std::string_view self_fd_prefix   = "/proc/self/fd/";
+      constexpr std::string_view thread_fd_prefix = "/proc/thread-self/fd/";
+      const auto resolve_mount_path = [&](uint64_t address, std::string* path) {
+        if (address == 0 || path == nullptr ||
+            !ReadTraceeCString(pid, address, kPathReadLimit, path) ||
+            path->empty()) {
+          return false;
         }
 
-        constexpr std::string_view self_fd_prefix   = "/proc/self/fd/";
-        constexpr std::string_view thread_fd_prefix = "/proc/thread-self/fd/";
-        std::string_view           fd_text;
-        if (destination.rfind(self_fd_prefix, 0) == 0) {
-          fd_text = std::string_view(destination).substr(self_fd_prefix.size());
-        } else if (destination.rfind(thread_fd_prefix, 0) == 0) {
-          fd_text =
-              std::string_view(destination).substr(thread_fd_prefix.size());
+        std::string_view fd_text;
+        if (path->rfind(self_fd_prefix, 0) == 0) {
+          fd_text = std::string_view(*path).substr(self_fd_prefix.size());
+        } else if (path->rfind(thread_fd_prefix, 0) == 0) {
+          fd_text = std::string_view(*path).substr(thread_fd_prefix.size());
         }
-
         char*      end = nullptr;
-        const long destination_fd =
-            fd_text.empty() ? -1 : strtol(fd_text.data(), &end, 10);
+        const long fd = fd_text.empty() ? -1 : strtol(fd_text.data(), &end, 10);
         if (!fd_text.empty() && end == fd_text.data() + fd_text.size() &&
-            destination_fd >= 0 && destination_fd <= INT_MAX) {
-          char fd_path[64];
-          snprintf(
-              fd_path, sizeof(fd_path), "/proc/%d/fd/%ld", pid, destination_fd);
-          char          real_destination[kPathReadLimit];
-          const ssize_t real_destination_size =
-              readlink(fd_path, real_destination, sizeof(real_destination) - 1);
-          if (real_destination_size > 0) {
-            real_destination[real_destination_size] = '\0';
-            state->emulated_mount_points.emplace(real_destination);
-          }
-          ResolveVirtualPathBase(pid, static_cast<int>(destination_fd),
-              normalized_rootfs, &destination);
-        } else if (!IsAbsoluteUnixPath(destination)) {
-          std::string cwd;
-          if (ResolveVirtualPathBase(pid, AT_FDCWD, normalized_rootfs, &cwd)) {
-            destination = ResolveVirtualRelativePath(cwd, destination);
-          }
+            fd >= 0 && fd <= INT_MAX) {
+          return ResolveVirtualPathBase(
+              pid, static_cast<int>(fd), normalized_rootfs, path);
         }
+
+        if (!IsAbsoluteUnixPath(*path)) {
+          std::string cwd;
+          if (!ResolveVirtualPathBase(pid, AT_FDCWD, normalized_rootfs, &cwd)) {
+            return false;
+          }
+          *path = ResolveVirtualRelativePath(cwd, *path);
+        }
+        if (!state->emulated_old_root.empty() &&
+            (*path == state->emulated_old_root ||
+                path->rfind(state->emulated_old_root + "/", 0) == 0)) {
+          *path = path->substr(state->emulated_old_root.size());
+          if (path->empty()) {
+            *path = "/";
+          }
+        } else if (!state->emulated_new_root.empty() &&
+                   !IsPassthroughUnixPath(*path)) {
+          *path = state->emulated_new_root + *path;
+        }
+        return true;
+      };
+
+      std::string destination;
+      if (resolve_mount_path(regs->regs[1], &destination)) {
         state->emulated_mount_points.insert(destination);
         state->emulated_mount_points.insert(
             RewritePathToRootfs(normalized_rootfs, destination));
+
+        std::string source;
+        if (resolve_mount_path(regs->regs[0], &source)) {
+          source = ResolveEmulatedBindMounts(*state, source);
+          if ((regs->regs[3] & MS_BIND) != 0) {
+            state->emulated_bind_mounts[destination] = source;
+          } else {
+            state->emulated_bind_mounts.erase(destination);
+          }
+        }
         __android_log_print(ANDROID_LOG_VERBOSE, kLogTag,
-            "Recorded emulated mount pid=%d destination=%s mounts=%zu", pid,
-            destination.c_str(), state->emulated_mount_points.size());
+            "Recorded emulated mount pid=%d source=%s destination=%s "
+            "mounts=%zu",
+            pid, source.c_str(), destination.c_str(),
+            state->emulated_mount_points.size());
       }
       SetEmulatedSyscallReturn(pid, state, regs, 0);
       return true;
@@ -2404,6 +2450,7 @@ void RewritePathArgument(pid_t pid, const std::string& normalized_rootfs,
     virtual_path = state.emulated_new_root + virtual_path;
   }
 
+  virtual_path = ResolveEmulatedBindMounts(state, virtual_path);
   virtual_path = ResolveVirtualSymlinks(normalized_rootfs, virtual_path,
       ShouldFollowFinalSymlink(pid, *regs, arg_index));
   const std::string rewritten_path =
