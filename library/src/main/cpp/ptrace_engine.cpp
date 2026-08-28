@@ -143,6 +143,7 @@ constexpr uint64_t    kIpProtoIcmpv6          = 58;
 constexpr uint64_t    kNetlinkAudit           = 9;
 constexpr uint64_t    kNetlinkRoute           = 0;
 constexpr uint32_t    kUnchangedId            = UINT32_MAX;
+constexpr uint64_t    kResolveInRoot          = 0x10;
 constexpr uint64_t    kMaxSupplementaryGroups = 65536;
 constexpr size_t      kMaxControlMessageSize  = 65536;
 constexpr uint64_t    kNamespaceCloneFlags =
@@ -202,6 +203,12 @@ struct UnixCredentials {
 struct ExecPlan {
   std::string              executable_path;
   std::vector<std::string> args;
+};
+
+struct OpenHow {
+  uint64_t flags;
+  uint64_t mode;
+  uint64_t resolve;
 };
 
 std::string ResolveVirtualExecutablePath(const std::string& normalized_rootfs,
@@ -327,8 +334,9 @@ std::string ResolveVirtualRelativePath(
 }
 
 std::string ResolveVirtualSymlinks(const std::string& normalized_rootfs,
-    const std::string& path, bool follow_final_symlink) {
-  if (IsPassthroughUnixPath(path)) {
+    const std::string& path, bool follow_final_symlink,
+    bool allow_passthrough = true) {
+  if (allow_passthrough && IsPassthroughUnixPath(path)) {
     return path;
   }
 
@@ -377,7 +385,9 @@ std::string ResolveVirtualSymlinks(const std::string& normalized_rootfs,
     }
 
     const std::string real_path =
-        RewritePathToRootfs(normalized_rootfs, candidate_path);
+        allow_passthrough ?
+            RewritePathToRootfs(normalized_rootfs, candidate_path) :
+            normalized_rootfs + candidate_path;
     char          target[kPathReadLimit];
     const ssize_t target_size =
         readlink(real_path.c_str(), target, sizeof(target) - 1);
@@ -2418,6 +2428,59 @@ void RewritePathArgument(pid_t pid, const std::string& normalized_rootfs,
   }
 }
 
+void RewriteOpenat2IfNeeded(
+    pid_t pid, const std::string& normalized_rootfs, user_pt_regs* regs) {
+  if (regs == nullptr || regs->regs[8] != kSysOpenat2 ||
+      regs->regs[3] != sizeof(OpenHow)) {
+    return;
+  }
+
+  OpenHow how{};
+  if (!ReadTraceeMemory(pid, regs->regs[2], &how, sizeof(how)) ||
+      how.resolve != kResolveInRoot || how.flags > UINT32_MAX ||
+      how.mode > UINT32_MAX) {
+    return;
+  }
+
+  std::string path;
+  std::string virtual_root;
+  if (!ReadTraceeCString(pid, regs->regs[1], kPathReadLimit, &path) ||
+      path.empty() ||
+      !ResolveVirtualPathBase(pid, static_cast<int>(regs->regs[0]),
+          normalized_rootfs, &virtual_root)) {
+    return;
+  }
+
+  if (!IsAbsoluteUnixPath(path)) {
+    path.insert(path.begin(), '/');
+  }
+  const std::string resolution_root =
+      RewritePathToRootfs(normalized_rootfs, virtual_root);
+  const std::string resolved_path = ResolveVirtualSymlinks(
+      resolution_root, path, (how.flags & O_NOFOLLOW) == 0, false);
+  const std::string rewritten_path =
+      resolved_path == "/" ? resolution_root : resolution_root + resolved_path;
+  const uint64_t scratch_address =
+      regs->sp > kStackScratchOffset ? regs->sp - kStackScratchOffset : 0;
+  if (scratch_address == 0 ||
+      !WriteTraceeMemory(pid, scratch_address, rewritten_path.c_str(),
+          rewritten_path.size() + 1)) {
+    return;
+  }
+
+  regs->regs[1] = scratch_address;
+  regs->regs[2] = how.flags;
+  regs->regs[3] = how.mode;
+  regs->regs[8] = kSysOpenat;
+  if (!SetRegs(pid, *regs)) {
+    __android_log_print(
+        ANDROID_LOG_WARN, kLogTag, "Failed to rewrite openat2 for pid=%d", pid);
+    return;
+  }
+  __android_log_print(ANDROID_LOG_VERBOSE, kLogTag,
+      "rewrote openat2 to openat pid=%d path=%s", pid, rewritten_path.c_str());
+}
+
 void RewritePathArgumentsIfNeeded(pid_t pid,
     const std::string& normalized_rootfs, const TraceeState& state,
     user_pt_regs* regs) {
@@ -2448,10 +2511,12 @@ void RewritePathArgumentsIfNeeded(pid_t pid,
     case kSysNewfstatat:
     case kSysUtimensat:
     case kSysStatx:
-    case kSysOpenat2:
     case kSysFaccessat2:
       RewritePathArgument(
           pid, normalized_rootfs, state, regs, 1, 0, kStackScratchOffset);
+      return;
+    case kSysOpenat2:
+      RewriteOpenat2IfNeeded(pid, normalized_rootfs, regs);
       return;
     case kSysSymlinkat:
       RewritePathArgument(
