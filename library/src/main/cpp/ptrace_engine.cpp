@@ -1185,9 +1185,6 @@ bool MaybeEmulateMountNamespaceOperation(pid_t pid,
       }
 
       state->emulated_old_root = old_root.substr(new_root.size());
-      if (state->emulated_old_root.empty()) {
-        state->emulated_old_root = "/";
-      }
       state->emulated_new_root = new_root;
       SetEmulatedSyscallReturn(pid, state, regs, 0);
       return true;
