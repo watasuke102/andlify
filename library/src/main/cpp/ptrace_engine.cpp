@@ -85,6 +85,7 @@ constexpr uint64_t    kSysAccept              = 202;
 constexpr uint64_t    kSysConnect             = 203;
 constexpr uint64_t    kSysSendto              = 206;
 constexpr uint64_t    kSysRecvfrom            = 207;
+constexpr uint64_t    kSysGetsockopt          = 209;
 constexpr uint64_t    kSysSendmsg             = 211;
 constexpr uint64_t    kSysRecvmsg             = 212;
 constexpr uint64_t    kSysAccept4             = 242;
@@ -2011,6 +2012,41 @@ void RewriteUnixCredentials(pid_t pid, uint64_t message_address, uid_t app_uid,
   }
 }
 
+void RewritePeerCredentials(pid_t pid, uid_t app_uid, gid_t app_gid,
+    const std::unordered_map<pid_t, TraceeState>& states,
+    const user_pt_regs&                           regs) {
+  if (regs.regs[8] != kSysGetsockopt ||
+      static_cast<int64_t>(regs.regs[0]) < 0 || regs.regs[1] != SOL_SOCKET ||
+      regs.regs[2] != SO_PEERCRED || regs.regs[3] == 0 || regs.regs[4] == 0) {
+    return;
+  }
+
+  socklen_t length = 0;
+  if (!ReadTraceeMemory(pid, regs.regs[4], &length, sizeof(length)) ||
+      length < sizeof(UnixCredentials)) {
+    return;
+  }
+
+  UnixCredentials credentials{};
+  if (!ReadTraceeMemory(pid, regs.regs[3], &credentials, sizeof(credentials))) {
+    return;
+  }
+
+  const auto peer = states.find(credentials.pid);
+  if (peer != states.end()) {
+    credentials.uid = peer->second.effective_uid;
+    credentials.gid = peer->second.effective_gid;
+  } else {
+    if (credentials.uid == app_uid) {
+      credentials.uid = kRootUid;
+    }
+    if (credentials.gid == app_gid) {
+      credentials.gid = kRootGid;
+    }
+  }
+  WriteTraceeMemory(pid, regs.regs[3], &credentials, sizeof(credentials));
+}
+
 void ReplaceAppOwnership(struct stat* file_stat, uid_t app_uid, gid_t app_gid) {
   if (file_stat == nullptr) {
     return;
@@ -3110,6 +3146,7 @@ int TracerMain(const std::string& extract_dst_path,
             RewriteUnixCredentials(
                 pid, regs.regs[1], app_uid, app_gid, states, false);
           }
+          RewritePeerCredentials(pid, app_uid, app_gid, states, regs);
         }
         if (is_syscall_entry || !syscall_direction_known) {
           RewriteSockaddrIfNeeded(pid, normalized_rootfs, &regs);
