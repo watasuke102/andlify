@@ -50,6 +50,9 @@ std::string RewritePathToRootfs(
   if (original_path == kOverflowUidPath) {
     return normalized_rootfs + kOverflowUidBackingPath;
   }
+  if (original_path == kHostnamePath) {
+    return normalized_rootfs + kHostnameBackingPath;
+  }
   if (original_path == kOverflowGidPath) {
     return normalized_rootfs + kOverflowGidBackingPath;
   }

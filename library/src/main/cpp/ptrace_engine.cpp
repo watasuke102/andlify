@@ -28,6 +28,7 @@
 #include <sys/types.h>
 #include <sys/uio.h>
 #include <sys/un.h>
+#include <sys/utsname.h>
 #include <sys/wait.h>
 #include <unistd.h>
 
@@ -363,13 +364,15 @@ std::string ResolveVirtualRelativePath(
 
 std::string TranslateProcPath(pid_t               pid,
     const std::unordered_map<pid_t, TraceeState>& states, std::string path,
-    bool follow_final) {
+    bool follow_final, bool* root_reference = nullptr) {
+  if (root_reference != nullptr)
+    *root_reference = false;
   if (path.rfind("/proc/self/", 0) == 0) {
     path.replace(6, 4, std::to_string(pid));
   } else if (path.rfind("/proc/thread-self/", 0) == 0) {
     path.replace(6, 11, std::to_string(pid));
   }
-  if (!follow_final || path.rfind("/proc/", 0) != 0) {
+  if (path.rfind("/proc/", 0) != 0) {
     return path;
   }
   size_t separator = path.find('/', 6);
@@ -396,7 +399,23 @@ std::string TranslateProcPath(pid_t               pid,
     }
   }
   const auto found = states.find(target);
-  if (found == states.end() || !found->second.executable)
+  if (found == states.end())
+    return path;
+  const std::string suffix = path.substr(separator);
+  if (suffix == "/root" || suffix.rfind("/root/", 0) == 0) {
+    const bool final_root = suffix == "/root";
+    if (root_reference != nullptr)
+      *root_reference = final_root;
+    if (final_root && !follow_final)
+      return path;
+    const std::string root = found->second.emulated_new_root.empty() ?
+                                 "/" :
+                                 found->second.emulated_new_root;
+    return final_root ?
+               root :
+               (root == "/" ? suffix.substr(5) : root + suffix.substr(5));
+  }
+  if (!follow_final || !found->second.executable)
     return path;
   const auto& executable = *found->second.executable;
   int         fd         = -1;
@@ -414,11 +433,18 @@ std::string ResolveVirtualSymlinks(const std::string& normalized_rootfs,
     const std::string& path, bool follow_final_symlink,
     bool                                          allow_passthrough = true,
     const std::unordered_map<pid_t, TraceeState>* states            = nullptr,
-    pid_t                                         pid               = 0) {
+    pid_t pid = 0, size_t symlink_depth = 0) {
+  if (symlink_depth > kMaxSymlinkDepth)
+    return path;
   if (allow_passthrough && IsPassthroughUnixPath(path)) {
-    return states == nullptr ?
-               path :
-               TranslateProcPath(pid, *states, path, follow_final_symlink);
+    if (states == nullptr)
+      return path;
+    const std::string translated =
+        TranslateProcPath(pid, *states, path, follow_final_symlink);
+    if (translated == path)
+      return path;
+    return ResolveVirtualSymlinks(normalized_rootfs, translated,
+        follow_final_symlink, true, states, pid, symlink_depth + 1);
   }
 
   bool requires_directory = path.size() > 1 && path.back() == '/';
@@ -437,7 +463,6 @@ std::string ResolveVirtualSymlinks(const std::string& normalized_rootfs,
   }
 
   std::vector<std::string> resolved_components;
-  size_t                   symlink_depth = 0;
   while (!pending_components.empty()) {
     std::string component = std::move(pending_components.front());
     pending_components.pop_front();
@@ -464,8 +489,8 @@ std::string ResolveVirtualSymlinks(const std::string& normalized_rootfs,
       for (const auto& remaining : pending_components) {
         candidate_path += "/" + remaining;
       }
-      return TranslateProcPath(
-          pid, *states, candidate_path, follow_final_symlink);
+      return ResolveVirtualSymlinks(normalized_rootfs, candidate_path,
+          follow_final_symlink, true, states, pid, symlink_depth);
     }
 
     if (pending_components.empty() && !follow_final_symlink &&
@@ -871,23 +896,33 @@ bool MaybeEmulateProcReadlink(pid_t pid, const std::string& normalized_rootfs,
   }
   path = ResolveVirtualSymlinks(
       normalized_rootfs, path, false, true, &states, pid);
-  if (path.rfind("/proc/", 0) != 0)
+  if (path.rfind("/proc/", 0) != 0 || path == "/proc/self" ||
+      path == "/proc/thread-self")
     return false;
-  struct stat info{};
-  if (lstat(path.c_str(), &info) != 0 || !S_ISLNK(info.st_mode))
-    return false;
-  const std::string target = TranslateProcPath(pid, states, path, true);
-  char              buffer[kPathReadLimit];
-  const ssize_t     length = readlink(target.c_str(), buffer, sizeof(buffer));
-  if (length < 0) {
-    SetEmulatedSyscallReturn(pid, state, regs, -errno);
-    return true;
-  }
-  std::string result(buffer, length);
-  if (result == normalized_rootfs) {
-    result = "/";
-  } else if (result.rfind(normalized_rootfs + "/", 0) == 0) {
-    result.erase(0, normalized_rootfs.size());
+  bool              root_reference = false;
+  const std::string target =
+      TranslateProcPath(pid, states, path, true, &root_reference);
+  std::string result;
+  if (root_reference) {
+    // Android's proc root link exposes the host root and may deny readlink
+    // entirely.
+    result = target;
+  } else {
+    struct stat info{};
+    if (lstat(path.c_str(), &info) != 0 || !S_ISLNK(info.st_mode))
+      return false;
+    char          buffer[kPathReadLimit];
+    const ssize_t length = readlink(target.c_str(), buffer, sizeof(buffer));
+    if (length < 0) {
+      SetEmulatedSyscallReturn(pid, state, regs, -errno);
+      return true;
+    }
+    result.assign(buffer, length);
+    if (result == normalized_rootfs) {
+      result = "/";
+    } else if (result.rfind(normalized_rootfs + "/", 0) == 0) {
+      result.erase(0, normalized_rootfs.size());
+    }
   }
   if (regs->regs[3] == 0) {
     SetEmulatedSyscallReturn(pid, state, regs, -EINVAL);
@@ -2805,12 +2840,22 @@ bool PrepareSharedMemoryDirectory(const std::string& normalized_rootfs) {
 }
 
 bool PrepareEmulatedProcFiles(const std::string& normalized_rootfs) {
+  struct utsname identity{};
+  if (uname(&identity) != 0) {
+    __android_log_print(ANDROID_LOG_ERROR, kLogTag,
+        "Failed to read kernel hostname: %s", strerror(errno));
+    return false;
+  }
+  // The hostname sysctl may be unreadable even though uname exposes the same
+  // UTS name.
+  const std::string hostname = std::string(identity.nodename) + "\n";
   struct File {
     const char* backing_path;
     const char* value;
     size_t      value_size;
   };
-  constexpr File files[] = {
+  const File files[] = {
+      {kHostnameBackingPath,              hostname.c_str(),            hostname.size()             },
       {kInotifyMaxUserWatchesBackingPath, kInotifyMaxUserWatchesValue,
        sizeof(kInotifyMaxUserWatchesValue) - 1                                                     },
       {kOverflowUidBackingPath,           kOverflowIdValue,            sizeof(kOverflowIdValue) - 1},
