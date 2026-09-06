@@ -54,6 +54,7 @@ add_library(andlify_core STATIC
     path_rewrite.cpp
     ptrace_memory.cpp
     ptrace_engine.cpp
+    elf_exec.cpp
     rootfs_extractor.cpp
 )
 target_compile_definitions(andlify_core PRIVATE _GNU_SOURCE)
