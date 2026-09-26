@@ -57,7 +57,8 @@ std::string RewritePathToRootfs(
     return normalized_rootfs + kOverflowGidBackingPath;
   }
 
-  if (original_path.rfind(normalized_rootfs, 0) == 0) {
+  if (original_path == normalized_rootfs ||
+      original_path.rfind(normalized_rootfs + "/", 0) == 0) {
     return original_path;
   }
 

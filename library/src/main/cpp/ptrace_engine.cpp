@@ -25,6 +25,7 @@
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/syscall.h>
+#include <sys/sysmacros.h>
 #include <sys/types.h>
 #include <sys/uio.h>
 #include <sys/un.h>
@@ -42,10 +43,13 @@
 #include <vector>
 
 #include "elf_exec.h"
+#include "filesystem/virtual_filesystem.h"
+#include "ownership/ownership_store.h"
 #include "path_rewrite.h"
 #include "ptrace_memory.h"
 
 namespace {
+andlify::OwnershipStore* ownership = nullptr;
 
 constexpr const char* kLogTag                 = "andlify-ptrace";
 constexpr uint64_t    kSysSetxattr            = 5;
@@ -72,7 +76,6 @@ constexpr uint64_t    kSysFaccessat           = 48;
 constexpr uint64_t    kSysChdir               = 49;
 constexpr uint64_t    kSysFchmodat            = 53;
 constexpr uint64_t    kSysFchownat            = 54;
-constexpr uint64_t    kSysFchown              = 55;
 constexpr uint64_t    kSysOpenat              = 56;
 constexpr uint64_t    kSysReadlinkat          = 78;
 constexpr uint64_t    kSysNewfstatat          = 79;
@@ -138,7 +141,6 @@ constexpr uint64_t    kStackScratchOffset     = 0x800;
 constexpr uint64_t    kExecScratchSize        = 0x2000;
 constexpr size_t      kMaxSymlinkDepth        = 40;
 constexpr uint64_t    kRootUid                = 0;
-constexpr uint64_t    kRootGid                = 0;
 constexpr uint64_t    kAfUnix                 = 1;
 constexpr uint64_t    kAfInet                 = 2;
 constexpr uint64_t    kAfInet6                = 10;
@@ -159,13 +161,14 @@ constexpr uint64_t    kNamespaceCloneFlags =
     CLONE_NEWCGROUP | CLONE_NEWIPC | CLONE_NEWNET | CLONE_NEWNS | CLONE_NEWPID |
     CLONE_NEWUSER | CLONE_NEWUTS;
 constexpr const char* kDefaultEnvironment[][2] = {
-    {"PATH",    "/usr/bin:/bin:/usr/sbin:/sbin"},
-    {"HOME",    "/root"                        },
-    {"USER",    "root"                         },
-    {"LOGNAME", "root"                         },
-    {"PWD",     "/"                            },
-    {"TERM",    "xterm-256color"               },
-    {"TMPDIR",  "/tmp"                         },
+    {"PATH",            "/usr/bin:/bin:/usr/sbin:/sbin"},
+    {"HOME",            "/home/user"                   },
+    {"USER",            "user"                         },
+    {"LOGNAME",         "user"                         },
+    {"PWD",             "/"                            },
+    {"TERM",            "xterm-256color"               },
+    {"TMPDIR",          "/tmp"                         },
+    {"XDG_RUNTIME_DIR", "/run/user/1000"               },
 };
 
 constexpr char kInotifyMaxUserWatchesValue[] = "8192\n";
@@ -205,15 +208,19 @@ struct TraceeState {
   std::string                        emulated_old_root;
   std::string                        emulated_mountinfo_path;
   mode_t                             pending_open_permission_mode = 0;
-  uint32_t                           real_uid                     = kRootUid;
-  uint32_t                           effective_uid                = kRootUid;
-  uint32_t                           saved_uid                    = kRootUid;
-  uint32_t                           fs_uid                       = kRootUid;
-  uint32_t                           real_gid                     = kRootGid;
-  uint32_t                           effective_gid                = kRootGid;
-  uint32_t                           saved_gid                    = kRootGid;
-  uint32_t                           fs_gid                       = kRootGid;
-  std::vector<uint32_t>              supplementary_groups{kRootGid};
+  andlify::PendingFile               pending_file;
+  andlify::ProcessOwner              published_identity;
+  bool                               no_new_privileges = false;
+  uint32_t                           file_umask        = 0022;
+  uint32_t                           real_uid          = 1000;
+  uint32_t                           effective_uid     = 1000;
+  uint32_t                           saved_uid         = 1000;
+  uint32_t                           fs_uid            = 1000;
+  uint32_t                           real_gid          = 1000;
+  uint32_t                           effective_gid     = 1000;
+  uint32_t                           saved_gid         = 1000;
+  uint32_t                           fs_gid            = 1000;
+  std::vector<uint32_t>              supplementary_groups{1000};
   std::unordered_set<std::string>    copied_lock_sources;
   std::unordered_set<std::string>    emulated_mount_nodes;
   std::unordered_set<std::string>    emulated_mount_points{"/"};
@@ -265,7 +272,8 @@ struct OpenHow {
   uint64_t resolve;
 };
 
-bool ResetEnvironment() {
+bool ResetEnvironment(uint32_t uid = 1000) {
+  umask(0022);
   if (clearenv() != 0) {
     return false;
   }
@@ -275,6 +283,9 @@ bool ResetEnvironment() {
       return false;
     }
   }
+  if (uid == 0)
+    return setenv("HOME", "/root", 1) == 0 && setenv("USER", "root", 1) == 0 &&
+           setenv("LOGNAME", "root", 1) == 0;
   return true;
 }
 
@@ -433,7 +444,8 @@ std::string ResolveVirtualSymlinks(const std::string& normalized_rootfs,
     const std::string& path, bool follow_final_symlink,
     bool                                          allow_passthrough = true,
     const std::unordered_map<pid_t, TraceeState>* states            = nullptr,
-    pid_t pid = 0, size_t symlink_depth = 0) {
+    pid_t pid = 0, size_t symlink_depth = 0,
+    const std::function<bool(const std::string&)>& permit = {}) {
   if (symlink_depth > kMaxSymlinkDepth)
     return path;
   if (allow_passthrough && IsPassthroughUnixPath(path)) {
@@ -444,7 +456,7 @@ std::string ResolveVirtualSymlinks(const std::string& normalized_rootfs,
     if (translated == path)
       return path;
     return ResolveVirtualSymlinks(normalized_rootfs, translated,
-        follow_final_symlink, true, states, pid, symlink_depth + 1);
+        follow_final_symlink, true, states, pid, symlink_depth + 1, permit);
   }
 
   bool requires_directory = path.size() > 1 && path.back() == '/';
@@ -466,6 +478,14 @@ std::string ResolveVirtualSymlinks(const std::string& normalized_rootfs,
   while (!pending_components.empty()) {
     std::string component = std::move(pending_components.front());
     pending_components.pop_front();
+    if (permit) {
+      std::string parent;
+      for (const auto& entry : resolved_components) parent += "/" + entry;
+      if (parent.empty())
+        parent = "/";
+      if (!permit(parent))
+        return {};
+    }
     if (component == ".") {
       continue;
     }
@@ -490,7 +510,7 @@ std::string ResolveVirtualSymlinks(const std::string& normalized_rootfs,
         candidate_path += "/" + remaining;
       }
       return ResolveVirtualSymlinks(normalized_rootfs, candidate_path,
-          follow_final_symlink, true, states, pid, symlink_depth);
+          follow_final_symlink, true, states, pid, symlink_depth, permit);
     }
 
     if (pending_components.empty() && !follow_final_symlink &&
@@ -1718,8 +1738,6 @@ bool MaybeEmulateUidGidSyscall(
       return true;
     }
     case kSysCapset:
-    case kSysFchownat:
-    case kSysFchown:
       SetEmulatedSyscallReturn(pid, state, regs, 0);
       return true;
     case kSysGetresuid: {
@@ -1885,16 +1903,20 @@ void RewriteUnixCredentials(pid_t pid, uint64_t message_address, uid_t app_uid,
         credentials.uid = app_uid;
         credentials.gid = app_gid;
       } else {
-        const auto sender = states.find(credentials.pid);
+        andlify::ProcessOwner identity;
+        const auto            sender = states.find(credentials.pid);
         if (sender != states.end()) {
-          credentials.uid = sender->second.effective_uid;
-          credentials.gid = sender->second.effective_gid;
+          credentials.uid = sender->second.real_uid;
+          credentials.gid = sender->second.real_gid;
+        } else if (ownership->Process(credentials.pid, &identity)) {
+          credentials.uid = identity.real_uid;
+          credentials.gid = identity.real_gid;
         } else {
           if (credentials.uid == app_uid) {
-            credentials.uid = kRootUid;
+            credentials.uid = 1000;
           }
           if (credentials.gid == app_gid) {
-            credentials.gid = kRootGid;
+            credentials.gid = 1000;
           }
         }
       }
@@ -1936,16 +1958,20 @@ void RewritePeerCredentials(pid_t pid, uid_t app_uid, gid_t app_gid,
     return;
   }
 
-  const auto peer = states.find(credentials.pid);
+  andlify::ProcessOwner identity;
+  const auto            peer = states.find(credentials.pid);
   if (peer != states.end()) {
     credentials.uid = peer->second.effective_uid;
     credentials.gid = peer->second.effective_gid;
+  } else if (ownership->Process(credentials.pid, &identity)) {
+    credentials.uid = identity.effective_uid;
+    credentials.gid = identity.effective_gid;
   } else {
     if (credentials.uid == app_uid) {
-      credentials.uid = kRootUid;
+      credentials.uid = 1000;
     }
     if (credentials.gid == app_gid) {
-      credentials.gid = kRootGid;
+      credentials.gid = 1000;
     }
   }
   WriteTraceeMemory(pid, regs.regs[3], &credentials, sizeof(credentials));
@@ -1955,12 +1981,18 @@ void ReplaceAppOwnership(struct stat* file_stat, uid_t app_uid, gid_t app_gid) {
   if (file_stat == nullptr) {
     return;
   }
-  if (file_stat->st_uid == app_uid) {
-    file_stat->st_uid = kRootUid;
+  andlify::FileOwner owner;
+  if (ownership &&
+      ownership->Lookup(file_stat->st_dev, file_stat->st_ino, &owner)) {
+    file_stat->st_uid  = owner.uid;
+    file_stat->st_gid  = owner.gid;
+    file_stat->st_mode = owner.mode;
+    return;
   }
-  if (file_stat->st_gid == app_gid) {
-    file_stat->st_gid = kRootGid;
-  }
+  if (file_stat->st_uid == app_uid)
+    file_stat->st_uid = 1000;
+  if (file_stat->st_gid == app_gid)
+    file_stat->st_gid = 1000;
 }
 
 void ReplaceAppOwnership(
@@ -1968,12 +2000,19 @@ void ReplaceAppOwnership(
   if (file_stat == nullptr) {
     return;
   }
-  if (file_stat->stx_uid == app_uid) {
-    file_stat->stx_uid = kRootUid;
+  andlify::FileOwner owner;
+  if (ownership && ownership->Lookup(makedev(file_stat->stx_dev_major,
+                                         file_stat->stx_dev_minor),
+                       file_stat->stx_ino, &owner)) {
+    file_stat->stx_uid  = owner.uid;
+    file_stat->stx_gid  = owner.gid;
+    file_stat->stx_mode = owner.mode;
+    return;
   }
-  if (file_stat->stx_gid == app_gid) {
-    file_stat->stx_gid = kRootGid;
-  }
+  if (file_stat->stx_uid == app_uid)
+    file_stat->stx_uid = 1000;
+  if (file_stat->stx_gid == app_gid)
+    file_stat->stx_gid = 1000;
 }
 
 void RewriteStatOwnershipIfNeeded(
@@ -2165,16 +2204,25 @@ void ApplyExecCredentialTransition(TraceeState* state) {
   if (fstat(state->pending_executable->image->fd, &executable_stat) != 0) {
     return;
   }
-  if ((executable_stat.st_mode & S_ISUID) != 0) {
-    state->effective_uid = state->saved_uid = state->fs_uid = kRootUid;
+  ReplaceAppOwnership(&executable_stat, getuid(), getgid());
+  if (!state->no_new_privileges && (executable_stat.st_mode & S_ISUID) != 0) {
+    state->effective_uid = state->saved_uid = state->fs_uid =
+        executable_stat.st_uid;
   }
-  if ((executable_stat.st_mode & S_ISGID) != 0) {
-    state->effective_gid = state->saved_gid = state->fs_gid = kRootGid;
+  if (!state->no_new_privileges && (executable_stat.st_mode & S_ISGID) != 0) {
+    state->effective_gid = state->saved_gid = state->fs_gid =
+        executable_stat.st_gid;
   }
+  state->saved_uid = state->fs_uid = state->effective_uid;
+  state->saved_gid = state->fs_gid = state->effective_gid;
 }
 
 bool MaybeEmulatePrctlSyscall(
     pid_t pid, TraceeState* state, user_pt_regs* regs) {
+  if (regs && regs->regs[8] == kSysPrctl &&
+      regs->regs[0] == PR_SET_NO_NEW_PRIVS && regs->regs[1] == 1 &&
+      regs->regs[2] == 0 && regs->regs[3] == 0 && regs->regs[4] == 0)
+    state->no_new_privileges = true;
   if (regs == nullptr || regs->regs[8] != kSysPrctl ||
       regs->regs[0] != PR_SET_DUMPABLE || regs->regs[1] != 0) {
     return false;
@@ -2340,6 +2388,100 @@ bool ApplyEmulatedSyscallReturn(pid_t pid, TraceeState* state) {
     return false;
   }
 
+  return true;
+}
+
+bool HandleVirtualFiles(pid_t pid, const std::string& root,
+    const std::unordered_map<pid_t, TraceeState>& states, TraceeState* state,
+    user_pt_regs* regs) {
+  if (regs->regs[8] == 166)
+    state->file_umask = regs->regs[0] & 0777;
+  const bool real_access =
+      regs->regs[8] == kSysFaccessat ||
+      (regs->regs[8] == kSysFaccessat2 && !(regs->regs[3] & AT_EACCESS));
+  const andlify::FileCredentials credentials{
+      real_access ? state->real_uid : state->fs_uid,
+      real_access ? state->real_gid : state->fs_gid,
+      state->supplementary_groups, state->file_umask};
+  const auto resolve = [&](int arg, int dir_arg, bool follow,
+                           std::string* path) {
+    errno                       = 0;
+    int        resolution_error = 0;
+    const auto permit           = [&](const std::string& directory) {
+      resolution_error = andlify::CheckFileAccess(
+          *ownership, RewritePathToRootfs(root, directory), credentials, X_OK);
+      return resolution_error == 0;
+    };
+    std::string original;
+    if (!ReadTraceeCString(pid, regs->regs[arg], kPathReadLimit, &original))
+      return false;
+    if (original.empty()) {
+      if (dir_arg < 0)
+        return false;
+      *path = "/proc/" + std::to_string(pid) + "/fd/" +
+              std::to_string(regs->regs[dir_arg]);
+      return true;
+    }
+    if (regs->regs[8] == kSysOpenat2) {
+      OpenHow how{};
+      if (!ReadTraceeMemory(pid, regs->regs[2], &how, sizeof(how)))
+        return false;
+      if (how.resolve & kResolveInRoot) {
+        std::string base;
+        if (!ResolveVirtualPathBase(
+                pid, static_cast<int>(regs->regs[0]), root, &base))
+          return false;
+        if (!original.empty() && original.front() != '/')
+          original.insert(original.begin(), '/');
+        const auto resolution_root = RewritePathToRootfs(root, base);
+        const auto rooted_permit   = [&](const std::string& directory) {
+          resolution_error = andlify::CheckFileAccess(
+              *ownership, resolution_root + directory, credentials, X_OK);
+          return resolution_error == 0;
+        };
+        *path =
+            resolution_root + ResolveVirtualSymlinks(resolution_root, original,
+                                  follow, false, nullptr, 0, 0, rooted_permit);
+        if (resolution_error) {
+          errno = resolution_error;
+          return false;
+        }
+        return true;
+      }
+    }
+    if (!IsAbsoluteUnixPath(original)) {
+      std::string base;
+      if (!ResolveVirtualPathBase(pid,
+              dir_arg < 0 ? AT_FDCWD : static_cast<int>(regs->regs[dir_arg]),
+              root, &base))
+        return false;
+      original = base + "/" + original;
+    } else if (!state->emulated_new_root.empty() &&
+               !IsPassthroughUnixPath(original)) {
+      original = state->emulated_new_root + original;
+    }
+    original = ResolveEmulatedBindMounts(*state, original);
+    *path =
+        RewritePathToRootfs(root, ResolveVirtualSymlinks(root, original, follow,
+                                      true, &states, pid, 0, permit));
+    if (resolution_error) {
+      errno = resolution_error;
+      return false;
+    }
+    return true;
+  };
+  int64_t  result;
+  uint64_t arguments[6];
+  std::copy_n(regs->regs, 6, arguments);
+  if (!andlify::PrepareFileOperation(pid, regs->regs[8], arguments, credentials,
+          *ownership, resolve, &state->pending_file, &result)) {
+    if (!std::equal(arguments, arguments + 6, regs->regs)) {
+      std::copy_n(arguments, 6, regs->regs);
+      SetRegs(pid, *regs);
+    }
+    return false;
+  }
+  SetEmulatedSyscallReturn(pid, state, regs, result);
   return true;
 }
 
@@ -2653,7 +2795,7 @@ void RewriteSockaddrIfNeeded(
 
 int ChildTraceeMain(const std::string& extract_dst_path,
     const std::string& command_path_in_rootfs, int stdin_fd, int stdout_fd,
-    int stderr_fd) {
+    int stderr_fd, uint32_t uid) {
   if (dup2(stdin_fd, STDIN_FILENO) < 0) {
     return 127;
   }
@@ -2668,7 +2810,7 @@ int ChildTraceeMain(const std::string& extract_dst_path,
     return 127;
   }
 
-  if (!ResetEnvironment()) {
+  if (!ResetEnvironment(uid)) {
     return 127;
   }
 
@@ -2918,12 +3060,20 @@ bool PrepareEmulatedProcFiles(const std::string& normalized_rootfs) {
 }
 
 int TracerMain(const std::string& extract_dst_path,
-    const std::function<int()>&   child_spawn_func) {
+    const std::function<int()>& child_spawn_func, uint32_t uid, uint32_t gid) {
   prctl(PR_SET_PDEATHSIG, SIGKILL);
 
-  const std::string normalized_rootfs = NormalizeRootfsPrefix(extract_dst_path);
-  const uid_t       app_uid           = getuid();
-  const gid_t       app_gid           = getgid();
+  std::string normalized_rootfs = NormalizeRootfsPrefix(extract_dst_path);
+  andlify::OwnershipStore owner_store;
+  if (!owner_store.Open(normalized_rootfs, true)) {
+    __android_log_print(ANDROID_LOG_ERROR, kLogTag,
+        "Ownership initialization failed: %s", strerror(errno));
+    return 1;
+  }
+  normalized_rootfs   = owner_store.root();
+  ownership           = &owner_store;
+  const uid_t app_uid = getuid();
+  const gid_t app_gid = getgid();
   if (!PrepareSharedMemoryDirectory(normalized_rootfs)) {
     return 1;
   }
@@ -2948,6 +3098,11 @@ int TracerMain(const std::string& extract_dst_path,
   std::unordered_set<pid_t>              tracked_pids;
 
   TraceeState initial_state;
+  initial_state.real_uid      = initial_state.effective_uid =
+      initial_state.saved_uid = initial_state.fs_uid = uid;
+  initial_state.real_gid      = initial_state.effective_gid =
+      initial_state.saved_gid = initial_state.fs_gid = gid;
+  initial_state.supplementary_groups                 = {gid};
   if (getrlimit(RLIMIT_NOFILE, &initial_state.file_descriptor_limit) != 0) {
     initial_state.file_descriptor_limit = {
         .rlim_cur = 1024,
@@ -2979,6 +3134,7 @@ int TracerMain(const std::string& extract_dst_path,
       if (!states[pid].emulated_mountinfo_path.empty()) {
         unlink(states[pid].emulated_mountinfo_path.c_str());
       }
+      ownership->ForgetProcess(pid);
       states.erase(pid);
       continue;
     }
@@ -2989,6 +3145,7 @@ int TracerMain(const std::string& extract_dst_path,
       if (!states[pid].emulated_mountinfo_path.empty()) {
         unlink(states[pid].emulated_mountinfo_path.c_str());
       }
+      ownership->ForgetProcess(pid);
       states.erase(pid);
       continue;
     }
@@ -2996,7 +3153,21 @@ int TracerMain(const std::string& extract_dst_path,
       continue;
     }
 
-    auto& state = states[pid];
+    auto&                       state = states[pid];
+    const andlify::ProcessOwner identity{pid, state.real_uid,
+        state.effective_uid, state.real_gid, state.effective_gid};
+    const auto&                 published = state.published_identity;
+    if (identity.pid != published.pid ||
+        identity.real_uid != published.real_uid ||
+        identity.effective_uid != published.effective_uid ||
+        identity.real_gid != published.real_gid ||
+        identity.effective_gid != published.effective_gid) {
+      if (!ownership->RegisterProcess(identity)) {
+        kill(pid, SIGKILL);
+        continue;
+      }
+      state.published_identity = identity;
+    }
     if (!state.options_applied) {
       state.options_applied = ApplyTraceOptions(pid);
     }
@@ -3023,6 +3194,18 @@ int TracerMain(const std::string& extract_dst_path,
       if (state.has_emulated_return && !is_syscall_entry) {
         RestoreOpenPermission(&state);
         ApplyEmulatedSyscallReturn(pid, &state);
+        const andlify::ProcessOwner updated{pid, state.real_uid,
+            state.effective_uid, state.real_gid, state.effective_gid};
+        if (updated.real_uid != published.real_uid ||
+            updated.effective_uid != published.effective_uid ||
+            updated.real_gid != published.real_gid ||
+            updated.effective_gid != published.effective_gid) {
+          if (!ownership->RegisterProcess(updated)) {
+            kill(pid, SIGKILL);
+            continue;
+          }
+          state.published_identity = updated;
+        }
         state.expect_entry = true;
         ResumeSyscall(pid, 0);
         continue;
@@ -3032,6 +3215,16 @@ int TracerMain(const std::string& extract_dst_path,
       if (GetRegs(pid, &regs)) {
         if (!is_syscall_entry) {
           RestoreOpenPermission(&state);
+          if (!andlify::FinishFileOperation(pid,
+                  static_cast<int64_t>(regs.regs[0]), *ownership,
+                  {state.fs_uid, state.fs_gid, state.supplementary_groups,
+                      state.file_umask},
+                  &state.pending_file)) {
+            __android_log_print(ANDROID_LOG_ERROR, kLogTag,
+                "Ownership update failed: %s", strerror(errno));
+            kill(pid, SIGKILL);
+            continue;
+          }
           state.pending_executable.reset();
           TrackEmulatedNetworkNamespaceFd(&state, regs);
           if (regs.regs[8] == kSysSendmsg ||
@@ -3054,7 +3247,9 @@ int TracerMain(const std::string& extract_dst_path,
           RedirectUserNamespaceControlFile(
               pid, normalized_rootfs, state, &regs);
           RedirectEmulatedMountInfo(pid, normalized_rootfs, &state, &regs);
-          if (!MaybeEmulateNamespaceSyscall(pid, &state, &regs) &&
+          if (!HandleVirtualFiles(
+                  pid, normalized_rootfs, states, &state, &regs) &&
+              !MaybeEmulateNamespaceSyscall(pid, &state, &regs) &&
               !MaybeEmulateMountNamespaceOperation(
                   pid, normalized_rootfs, &state, &regs) &&
               !MaybeEmulateNetworkNamespaceOperation(pid, &state, &regs) &&
@@ -3104,6 +3299,10 @@ int TracerMain(const std::string& extract_dst_path,
           child_state.pending_open_permission_path.clear();
           child_state.pending_open_permission_mode = 0;
           child_state.pending_executable.reset();
+          child_state.pending_file = {};
+          ownership->RegisterProcess({static_cast<int32_t>(new_pid),
+              child_state.real_uid, child_state.effective_uid,
+              child_state.real_gid, child_state.effective_gid});
           states.insert_or_assign(
               static_cast<pid_t>(new_pid), std::move(child_state));
         }
@@ -3124,8 +3323,11 @@ int TracerMain(const std::string& extract_dst_path,
           auto&                     executable = *state.pending_executable;
           std::vector<Elf64_auxv_t> auxv;
           const char*               stage = "load executable";
+          ApplyExecCredentialTransition(&state);
           int error = InitializeElfExecutable(pid, *executable.image,
               executable.interpreter.get(), executable.execfn, executable.comm,
+              {state.real_uid, state.effective_uid, state.real_gid,
+                  state.effective_gid},
               &auxv);
           if (error == 0) {
             stage              = "create auxv";
@@ -3162,7 +3364,7 @@ int TracerMain(const std::string& extract_dst_path,
             kill(pid, SIGKILL);
             continue;
           }
-          ApplyExecCredentialTransition(&state);
+
           executable.interpreter.reset();
           state.executable   = std::move(state.pending_executable);
           state.expect_entry = true;
@@ -3198,7 +3400,7 @@ int TracerMain(const std::string& extract_dst_path,
 
 int StartChroot(const std::string& extract_dst_path,
     const std::string& command_path_in_rootfs, int stdin_fd, int stdout_fd,
-    int stderr_fd) {
+    int stderr_fd, uint32_t uid, uint32_t gid) {
   if (extract_dst_path.empty() || command_path_in_rootfs.empty()) {
     return -EINVAL;
   }
@@ -3208,7 +3410,7 @@ int StartChroot(const std::string& extract_dst_path,
 
   auto child_spawn_func = [=]() {
     return ChildTraceeMain(extract_dst_path, command_path_in_rootfs, stdin_fd,
-        stdout_fd, stderr_fd);
+        stdout_fd, stderr_fd, uid);
   };
 
   const pid_t tracer_pid = fork();
@@ -3217,7 +3419,7 @@ int StartChroot(const std::string& extract_dst_path,
   }
 
   if (tracer_pid == 0) {
-    _exit(TracerMain(extract_dst_path, child_spawn_func));
+    _exit(TracerMain(extract_dst_path, child_spawn_func, uid, gid));
   }
 
   return tracer_pid;
@@ -3225,7 +3427,7 @@ int StartChroot(const std::string& extract_dst_path,
 
 int StartChrootFunc(const std::string& extract_dst_path,
     const std::function<int()>& child_func, int stdin_fd, int stdout_fd,
-    int stderr_fd) {
+    int stderr_fd, uint32_t uid, uint32_t gid) {
   if (extract_dst_path.empty() || !child_func) {
     return -EINVAL;
   }
@@ -3248,7 +3450,7 @@ int StartChrootFunc(const std::string& extract_dst_path,
       return 127;
     }
 
-    if (!ResetEnvironment()) {
+    if (!ResetEnvironment(uid)) {
       return 127;
     }
 
@@ -3266,7 +3468,7 @@ int StartChrootFunc(const std::string& extract_dst_path,
   }
 
   if (tracer_pid == 0) {
-    _exit(TracerMain(extract_dst_path, child_spawn_func));
+    _exit(TracerMain(extract_dst_path, child_spawn_func, uid, gid));
   }
 
   return tracer_pid;

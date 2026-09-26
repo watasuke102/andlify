@@ -316,7 +316,8 @@ std::shared_ptr<ElfExecutable> OpenElfExecutable(const std::string& path) {
 
 int InitializeElfExecutable(pid_t pid, const ElfExecutable& executable,
     const ElfExecutable* interpreter, const std::string& execfn,
-    const std::string& comm, std::vector<Elf64_auxv_t>* auxiliary_vector) {
+    const std::string& comm, const ExecCredentials& credentials,
+    std::vector<Elf64_auxv_t>* auxiliary_vector) {
   RemoteSyscalls remote{pid};
   if (!remote.Install()) {
     return -errno;
@@ -369,6 +370,22 @@ int InitializeElfExecutable(pid_t pid, const ElfExecutable& executable,
   }
   for (auto& entry : *auxiliary_vector) {
     switch (entry.a_type) {
+      case AT_UID:
+        entry.a_un.a_val = credentials.uid;
+        break;
+      case AT_EUID:
+        entry.a_un.a_val = credentials.euid;
+        break;
+      case AT_GID:
+        entry.a_un.a_val = credentials.gid;
+        break;
+      case AT_EGID:
+        entry.a_un.a_val = credentials.egid;
+        break;
+      case AT_SECURE:
+        entry.a_un.a_val = credentials.uid != credentials.euid ||
+                           credentials.gid != credentials.egid;
+        break;
       case AT_PHDR:
         if (interpreter != nullptr)
           entry.a_un.a_val = bias + executable.phdr_address;

@@ -17,6 +17,8 @@
 #include <string>
 #include <vector>
 
+#include "ownership/ownership_store.h"
+
 namespace {
 
 constexpr const char* kLogTag      = "andlify-rootfs";
@@ -469,7 +471,12 @@ bool ExtractRootfs(
     return false;
   }
 
-  bool ok = true;
+  struct ArchivedOwner {
+    std::string path;
+    uint32_t    uid, gid, mode;
+  };
+  std::vector<ArchivedOwner> owners;
+  bool                       ok = true;
   while (ok) {
     archive_entry* entry    = nullptr;
     const int header_status = archive_read_next_header(archive_reader, &entry);
@@ -528,6 +535,10 @@ bool ExtractRootfs(
     const std::string target_path =
         relative_path == "." ? extract_dst_path :
                                JoinPath(extract_dst_path, relative_path);
+    owners.push_back(
+        {target_path, static_cast<uint32_t>(archive_entry_uid(entry)),
+            static_cast<uint32_t>(archive_entry_gid(entry)),
+            static_cast<uint32_t>(archive_entry_mode(entry))});
     archive_entry_set_pathname(entry, target_path.c_str());
 
     const int write_header_status = archive_write_header(archive_writer, entry);
@@ -572,6 +583,21 @@ bool ExtractRootfs(
         prepared_archive_path.c_str(), extract_dst_path.c_str());
     return false;
   }
+  andlify::OwnershipStore ownership;
+  if (!ownership.Open(extract_dst_path))
+    return false;
+  for (const auto& saved : owners) {
+    andlify::FileOwner owner;
+    if (!ownership.Identify(saved.path, &owner))
+      return false;
+    owner.uid  = saved.uid;
+    owner.gid  = saved.gid;
+    owner.mode = saved.mode;
+    if (!ownership.Set(owner, false))
+      return false;
+  }
+  if (!ownership.Checkpoint())
+    return false;
   if (!WriteExtractionMarker(extract_dst_path)) {
     __android_log_print(ANDROID_LOG_ERROR, kLogTag,
         "ExtractRootfs: failed to write marker, dst=%s",

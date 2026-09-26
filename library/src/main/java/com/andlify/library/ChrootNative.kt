@@ -15,6 +15,8 @@ object ChrootNative {
         stdinFd: Int,
         stdoutFd: Int,
         stderrFd: Int,
+        uid: Int = 1000,
+        gid: Int = 1000,
     ): Int
 
     external fun start_chroot_func(
@@ -23,6 +25,8 @@ object ChrootNative {
         stdinFd: Int,
         stdoutFd: Int,
         stderrFd: Int,
+        uid: Int = 1000,
+        gid: Int = 1000,
     ): Int
 
     external fun stop_chroot(pid: Int)

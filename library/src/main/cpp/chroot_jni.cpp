@@ -46,12 +46,13 @@ jboolean JniExtractRootfs(JNIEnv* env, jobject /*thiz*/, jstring archive_path,
 
 jint JniStartChroot(JNIEnv* env, jobject /*thiz*/, jstring extract_dst_path,
     jstring command_path_in_rootfs, jint stdin_fd, jint stdout_fd,
-    jint stderr_fd) {
+    jint stderr_fd, jint uid, jint gid) {
   const std::string rootfs_path = JStringToUtf8(env, extract_dst_path);
   const std::string command     = JStringToUtf8(env, command_path_in_rootfs);
   return static_cast<jint>(
       StartChroot(rootfs_path, command, static_cast<int>(stdin_fd),
-          static_cast<int>(stdout_fd), static_cast<int>(stderr_fd)));
+          static_cast<int>(stdout_fd), static_cast<int>(stderr_fd),
+          static_cast<uint32_t>(uid), static_cast<uint32_t>(gid)));
 }
 
 void JniStopChroot(JNIEnv* /*env*/, jobject /*thiz*/, jint pid) {
@@ -59,7 +60,8 @@ void JniStopChroot(JNIEnv* /*env*/, jobject /*thiz*/, jint pid) {
 }
 
 jint JniStartChrootFunc(JNIEnv* env, jobject /*thiz*/, jstring extract_dst_path,
-    jobject runnable, jint stdin_fd, jint stdout_fd, jint stderr_fd) {
+    jobject runnable, jint stdin_fd, jint stdout_fd, jint stderr_fd, jint uid,
+    jint gid) {
   const std::string rootfs_path = JStringToUtf8(env, extract_dst_path);
 
   auto child_func = [env, runnable]() -> int {
@@ -82,7 +84,8 @@ jint JniStartChrootFunc(JNIEnv* env, jobject /*thiz*/, jstring extract_dst_path,
 
   return static_cast<jint>(
       StartChrootFunc(rootfs_path, child_func, static_cast<int>(stdin_fd),
-          static_cast<int>(stdout_fd), static_cast<int>(stderr_fd)));
+          static_cast<int>(stdout_fd), static_cast<int>(stderr_fd),
+          static_cast<uint32_t>(uid), static_cast<uint32_t>(gid)));
 }
 
 }  // namespace
@@ -101,14 +104,14 @@ JNIEXPORT jint JNICALL JNI_OnLoad(JavaVM* vm, void* /*reserved*/) {
 
   static const JNINativeMethod methods[] = {
       {"is_rootfs_extracted", "(Ljava/lang/String;)Z",
-       reinterpret_cast<void*>(JniIsRootfsExtracted)                                                                },
+       reinterpret_cast<void*>(JniIsRootfsExtracted)                                                                  },
       {"extract_rootfs",      "(Ljava/lang/String;Ljava/lang/String;)Z",
-       reinterpret_cast<void*>(JniExtractRootfs)                                                                    },
-      {"start_chroot",        "(Ljava/lang/String;Ljava/lang/String;III)I",
-       reinterpret_cast<void*>(JniStartChroot)                                                                      },
-      {"start_chroot_func",   "(Ljava/lang/String;Ljava/lang/Runnable;III)I",
-       reinterpret_cast<void*>(JniStartChrootFunc)                                                                  },
-      {"stop_chroot",         "(I)V",                                         reinterpret_cast<void*>(JniStopChroot)},
+       reinterpret_cast<void*>(JniExtractRootfs)                                                                      },
+      {"start_chroot",        "(Ljava/lang/String;Ljava/lang/String;IIIII)I",
+       reinterpret_cast<void*>(JniStartChroot)                                                                        },
+      {"start_chroot_func",   "(Ljava/lang/String;Ljava/lang/Runnable;IIIII)I",
+       reinterpret_cast<void*>(JniStartChrootFunc)                                                                    },
+      {"stop_chroot",         "(I)V",                                           reinterpret_cast<void*>(JniStopChroot)},
   };
 
   if (env->RegisterNatives(

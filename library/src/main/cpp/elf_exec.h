@@ -7,6 +7,10 @@
 #include <string>
 #include <vector>
 
+struct ExecCredentials {
+  uint32_t uid, euid, gid, egid;
+};
+
 struct ElfExecutable {
   int                     fd = -1;
   Elf64_Ehdr              header{};
@@ -23,4 +27,5 @@ struct ElfExecutable {
 std::shared_ptr<ElfExecutable> OpenElfExecutable(const std::string& path);
 int InitializeElfExecutable(pid_t pid, const ElfExecutable& executable,
     const ElfExecutable* interpreter, const std::string& execfn,
-    const std::string& comm, std::vector<Elf64_auxv_t>* auxiliary_vector);
+    const std::string& comm, const ExecCredentials& credentials,
+    std::vector<Elf64_auxv_t>* auxiliary_vector);
