@@ -14,6 +14,14 @@ system daemons must use the appropriate initial identity and drop privileges
 for their user session; they must also update any hard-coded root session-bus
 paths. These identities never change the Android application's kernel UID.
 
+Host-created files do not automatically inherit the virtual session identity.
+Before exposing a host-created socket to clients, assign its virtual owner and
+mode with C++ `OwnershipStore::Open(rootfs, true)` and `SetPath(hostPath, uid,
+gid, mode)`, or Kotlin `ChrootNative.set_file_owner(rootfs, pathInRootfs, uid,
+gid, mode)`. The Kotlin path is absolute inside the rootfs. These are trusted
+host APIs; check their return values before starting clients. Updating only the
+host permissions does not update an already recorded virtual mode.
+
 Ownership is stored beside the rootfs in `<canonical-rootfs>.andlify-owners`:
 
 - `snapshot` and `journal` contain versioned, little-endian, checksummed records.

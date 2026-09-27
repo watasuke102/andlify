@@ -17,6 +17,8 @@ SOURCE = r'''
 #include <fstream>
 #include <fcntl.h>
 #include <sys/wait.h>
+#include <sys/socket.h>
+#include <sys/un.h>
 #include <unistd.h>
 using namespace andlify;
 namespace fs = std::filesystem;
@@ -127,6 +129,24 @@ int main(int argc, char** argv) {
     assert(store.Identify(path,&created));assert(store.Lookup(created.device,created.inode,&read));assert(read.uid==1000 && S_ISLNK(read.mode));
     path=root+"/etc/forbidden";args[2]=O_CREAT|O_WRONLY;
     assert(PrepareFileOperation(getpid(),56,args,user,store,resolver,&pending,&result));assert(result==-EACCES);
+    {
+      std::string socket_path=root+"/tmp/host-socket";
+      int listener=socket(AF_UNIX,SOCK_STREAM,0);assert(listener>=0);
+      sockaddr_un address{};address.sun_family=AF_UNIX;
+      assert(socket_path.size()<sizeof(address.sun_path));
+      std::strcpy(address.sun_path,socket_path.c_str());
+      assert(bind(listener,reinterpret_cast<sockaddr*>(&address),sizeof(address))==0);
+      assert(listen(listener,1)==0);
+      assert(store.SetPath(socket_path,0,0,0755));
+      args[1]=reinterpret_cast<uint64_t>(&address);args[2]=sizeof(address);
+      assert(PrepareFileOperation(getpid(),203,args,user,store,resolver,&pending,&result));
+      assert(result==-EACCES);
+      assert(store.SetPath(socket_path,1000,1000,0600));
+      assert(!PrepareFileOperation(getpid(),203,args,user,store,resolver,&pending,&result));
+      int client=socket(AF_UNIX,SOCK_STREAM,0);assert(client>=0);
+      assert(connect(client,reinterpret_cast<sockaddr*>(&address),sizeof(address))==0);
+      close(client);close(listener);
+    }
     for(int attempt=0;attempt<8;++attempt) {
       auto writer=fork();assert(writer>=0);
       if(writer==0) {

@@ -9,6 +9,14 @@ object ChrootNative {
 
     external fun extract_rootfs(archivePath: String, extractDstPath: String): Boolean
 
+    external fun set_file_owner(
+        rootfsPath: String,
+        pathInRootfs: String,
+        uid: Int,
+        gid: Int,
+        mode: Int,
+    ): Boolean
+
     external fun start_chroot(
         extractDstPath: String,
         commandPathInRootfs: String,

@@ -1,8 +1,12 @@
 #include <android/log.h>
 #include <jni.h>
 
+#include <cerrno>
+#include <cstring>
+#include <filesystem>
 #include <string>
 
+#include "ownership/ownership_store.h"
 #include "ptrace_engine.h"
 #include "rootfs_extractor.h"
 
@@ -42,6 +46,22 @@ jboolean JniExtractRootfs(JNIEnv* env, jobject /*thiz*/, jstring archive_path,
         destination.c_str());
   }
   return ok ? JNI_TRUE : JNI_FALSE;
+}
+
+jboolean JniSetFileOwner(JNIEnv* env, jobject /*thiz*/, jstring rootfs,
+    jstring path_in_rootfs, jint uid, jint gid, jint mode) {
+  const std::filesystem::path path =
+      std::filesystem::path(JStringToUtf8(env, path_in_rootfs))
+          .lexically_normal();
+  if (!path.is_absolute() || uid < 0 || gid < 0 || mode < 0 || mode > 07777)
+    return JNI_FALSE;
+  andlify::OwnershipStore ownership;
+  if (ownership.Open(JStringToUtf8(env, rootfs), true) &&
+      ownership.SetPath(ownership.root() + path.string(), uid, gid, mode))
+    return JNI_TRUE;
+  __android_log_print(ANDROID_LOG_ERROR, kLogTag,
+      "set_file_owner failed path=%s: %s", path.c_str(), strerror(errno));
+  return JNI_FALSE;
 }
 
 jint JniStartChroot(JNIEnv* env, jobject /*thiz*/, jstring extract_dst_path,
@@ -103,6 +123,8 @@ JNIEXPORT jint JNICALL JNI_OnLoad(JavaVM* vm, void* /*reserved*/) {
   }
 
   static const JNINativeMethod methods[] = {
+      {"set_file_owner",      "(Ljava/lang/String;Ljava/lang/String;III)Z",
+       reinterpret_cast<void*>(JniSetFileOwner)                                                                       },
       {"is_rootfs_extracted", "(Ljava/lang/String;)Z",
        reinterpret_cast<void*>(JniIsRootfsExtracted)                                                                  },
       {"extract_rootfs",      "(Ljava/lang/String;Ljava/lang/String;)Z",

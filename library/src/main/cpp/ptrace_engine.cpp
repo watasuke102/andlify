@@ -2481,6 +2481,18 @@ bool HandleVirtualFiles(pid_t pid, const std::string& root,
     }
     return false;
   }
+  // Log if Unix socket operations denied by virtual permission checks.
+  if (result < 0 &&
+      (regs->regs[8] == kSysBind || regs->regs[8] == kSysConnect)) {
+    sockaddr_un address{};
+    ReadTraceeMemory(pid, arguments[1], &address,
+        std::min<size_t>(arguments[2], sizeof(address)));
+    __android_log_print(ANDROID_LOG_WARN, kLogTag,
+        "Unix socket denied pid=%d syscall=%llu uid=%u gid=%u path=%.*s: %s",
+        pid, static_cast<unsigned long long>(regs->regs[8]), credentials.uid,
+        credentials.gid, static_cast<int>(sizeof(address.sun_path)),
+        address.sun_path, strerror(static_cast<int>(-result)));
+  }
   SetEmulatedSyscallReturn(pid, state, regs, result);
   return true;
 }
