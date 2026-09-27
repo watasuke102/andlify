@@ -5,6 +5,7 @@
 
 #include <cstdint>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 namespace andlify {
@@ -34,7 +35,10 @@ class OwnershipStore {
   OwnershipStore(const OwnershipStore&)            = delete;
   OwnershipStore& operator=(const OwnershipStore&) = delete;
   bool            Open(const std::string& root, bool prepare_user = false);
-  bool            Lookup(uint64_t device, uint64_t inode, FileOwner* owner);
+  bool TerminalOwner(const std::string& path, bool follow, FileOwner* owner,
+      const FileOwner* replacement = nullptr);
+  bool LookupTerminal(const struct stat& info, FileOwner* owner);
+  bool Lookup(uint64_t device, uint64_t inode, FileOwner* owner);
   bool Identify(const std::string& path, FileOwner* owner, bool follow = false);
   bool Set(const FileOwner& owner, bool durable = true,
       const FileOwner* previous = nullptr);
@@ -52,21 +56,22 @@ class OwnershipStore {
 
  private:
   struct Shared;
-  int         journal_fd_   = -1;
-  int         lock_fd_      = -1;
-  Shared*     shared_       = nullptr;
-  int         lease_fd_     = -1;
-  int         memory_fd_    = -1;
-  int         directory_fd_ = -1;
-  std::string root_;
-  std::string directory_;
-  bool        SetLocked(const FileOwner& owner, bool durable,
+  std::unordered_map<size_t, int> terminal_pins_;
+  int                             journal_fd_   = -1;
+  int                             lock_fd_      = -1;
+  Shared*                         shared_       = nullptr;
+  int                             lease_fd_     = -1;
+  int                             memory_fd_    = -1;
+  int                             directory_fd_ = -1;
+  std::string                     root_;
+  std::string                     directory_;
+  bool SetLocked(const FileOwner& owner, bool durable,
       const FileOwner* previous = nullptr);
-  bool        Lock();
-  void        Unlock();
-  bool        Replay();
-  bool        CheckpointLocked();
-  bool        Put(const FileOwner& owner);
-  bool        Scan();
+  bool Lock();
+  void Unlock();
+  bool Replay();
+  bool CheckpointLocked();
+  bool Put(const FileOwner& owner);
+  bool Scan();
 };
 }  // namespace andlify

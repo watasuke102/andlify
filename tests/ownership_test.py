@@ -160,6 +160,51 @@ int main(int argc, char** argv) {
       assert(store.Lookup(privileged.device,privileged.inode,&read));
       assert(read.uid==0 && (read.mode&07777)==04755);
     }
+    if (original_statx_error == 0) {
+      int master=posix_openpt(O_RDWR|O_NOCTTY);assert(master>=0);
+      assert(grantpt(master)==0 && unlockpt(master)==0);
+      path=ptsname(master);
+      int slave=open(path.c_str(),O_RDWR|O_NOCTTY);assert(slave>=0);
+      struct stat original{};assert(fstat(slave,&original)==0);
+      args[2]=0;args[3]=5;args[4]=0;
+      assert(PrepareFileOperation(getpid(),54,args,administrator,store,resolver,&pending,&result));
+      assert(result==0);
+      FileOwner terminal;assert(store.LookupTerminal(original,&terminal));
+      assert(terminal.uid==0 && terminal.gid==5);
+      struct stat unchanged{};assert(fstat(slave,&unchanged)==0);
+      assert(unchanged.st_uid==original.st_uid && unchanged.st_gid==original.st_gid);
+      auto reader=fork();assert(reader>=0);
+      if(reader==0) {
+        OwnershipStore second;assert(second.Open(root));FileOwner shared;
+        assert(second.LookupTerminal(original,&shared));assert(shared.uid==0 && shared.gid==5);
+        _exit(0);
+      }
+      int child_status;assert(waitpid(reader,&child_status,0)==reader && child_status==0);
+      args[0]=slave;args[1]=0600;
+      assert(PrepareFileOperation(getpid(),52,args,administrator,store,resolver,&pending,&result));
+      assert(result==0);
+      args[2]=O_RDWR;
+      assert(PrepareFileOperation(getpid(),56,args,user,store,resolver,&pending,&result));
+      assert(result==-EACCES);
+      assert(!PrepareFileOperation(getpid(),56,args,administrator,store,resolver,&pending,&result));
+      args[0]=slave;args[1]=1000;args[2]=1000;
+      assert(PrepareFileOperation(getpid(),55,args,administrator,store,resolver,&pending,&result));
+      assert(result==0 && store.LookupTerminal(original,&terminal) && terminal.uid==1000);
+      args[1]=0;
+      assert(PrepareFileOperation(getpid(),55,args,user,store,resolver,&pending,&result));
+      assert(result==-EPERM);
+      args[1]=77;args[2]=88;
+      assert(PrepareFileOperation(getpid(),55,args,administrator,store,resolver,&pending,&result));assert(result==0);
+      close(slave);close(master);
+      assert(!store.LookupTerminal(original,&terminal));
+      master=posix_openpt(O_RDWR|O_NOCTTY);assert(master>=0);
+      assert(grantpt(master)==0 && unlockpt(master)==0);
+      path=ptsname(master);
+      assert(store.TerminalOwner(path,true,&terminal));
+      assert(terminal.device==original.st_dev && terminal.inode==original.st_ino);
+      assert(terminal.uid==1000 && terminal.gid!=88);
+      close(master);
+    }
     for(int attempt=0;attempt<8;++attempt) {
       auto writer=fork();assert(writer>=0);
       if(writer==0) {
@@ -226,6 +271,7 @@ with tempfile.TemporaryDirectory(prefix="andlify-ownership-") as tmp:
     cpp = pathlib.Path(__file__).resolve().parents[1] / "library/src/main/cpp"
     subprocess.run(["c++", "-std=c++17", "-O2", "-Wall", "-Wextra", "-Werror", "-I", str(cpp),
                     str(source), str(cpp / "ownership/ownership_store.cpp"),
+                    str(cpp / "ownership/terminal_ownership.cpp"),
                     str(cpp / "ownership/ownership_persistence.cpp"), str(cpp / "ownership/user_setup.cpp"),
                     str(cpp / "filesystem/virtual_filesystem.cpp"),
                     str(cpp / "ptrace_memory.cpp"), "-Wl,--wrap=syscall", "-o", str(tmp / "test")], check=True)

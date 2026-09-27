@@ -21,7 +21,7 @@
 
 namespace andlify {
 using namespace ownership_detail;
-namespace {
+namespace ownership_detail {
 uint64_t ProcessStart(pid_t pid) {
   std::ifstream input("/proc/" + std::to_string(pid) + "/stat");
   std::string   line;
@@ -39,9 +39,10 @@ uint64_t ProcessStart(pid_t pid) {
   fields >> start;
   return start;
 }
-}  // namespace
+}  // namespace ownership_detail
 
 OwnershipStore::~OwnershipStore() {
+  for (const auto& pin : terminal_pins_) close(pin.second);
   if (journal_fd_ >= 0)
     close(journal_fd_);
   if (shared_)

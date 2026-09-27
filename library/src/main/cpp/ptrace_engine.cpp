@@ -1983,7 +1983,8 @@ void ReplaceAppOwnership(struct stat* file_stat, uid_t app_uid, gid_t app_gid) {
   }
   andlify::FileOwner owner;
   if (ownership &&
-      ownership->Lookup(file_stat->st_dev, file_stat->st_ino, &owner)) {
+      (ownership->LookupTerminal(*file_stat, &owner) ||
+          ownership->Lookup(file_stat->st_dev, file_stat->st_ino, &owner))) {
     file_stat->st_uid  = owner.uid;
     file_stat->st_gid  = owner.gid;
     file_stat->st_mode = owner.mode;
@@ -2000,10 +2001,16 @@ void ReplaceAppOwnership(
   if (file_stat == nullptr) {
     return;
   }
+  struct stat identity{};
+  identity.st_dev = makedev(file_stat->stx_dev_major, file_stat->stx_dev_minor);
+  identity.st_ino = file_stat->stx_ino;
+  identity.st_nlink = file_stat->stx_nlink;
+  identity.st_mode  = file_stat->stx_mode;
   andlify::FileOwner owner;
-  if (ownership && ownership->Lookup(makedev(file_stat->stx_dev_major,
-                                         file_stat->stx_dev_minor),
-                       file_stat->stx_ino, &owner)) {
+  if (ownership && (ownership->LookupTerminal(identity, &owner) ||
+                       ownership->Lookup(makedev(file_stat->stx_dev_major,
+                                             file_stat->stx_dev_minor),
+                           file_stat->stx_ino, &owner))) {
     file_stat->stx_uid  = owner.uid;
     file_stat->stx_gid  = owner.gid;
     file_stat->stx_mode = owner.mode;

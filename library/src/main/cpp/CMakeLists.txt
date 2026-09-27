@@ -52,6 +52,7 @@ FetchContent_MakeAvailable(libarchive)
 
 add_library(andlify_core STATIC
     ownership/ownership_store.cpp
+    ownership/terminal_ownership.cpp
     ownership/ownership_persistence.cpp
     ownership/user_setup.cpp
     filesystem/virtual_filesystem.cpp

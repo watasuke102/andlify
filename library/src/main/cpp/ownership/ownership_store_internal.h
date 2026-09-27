@@ -4,6 +4,14 @@
 
 namespace andlify {
 namespace ownership_detail {
+uint64_t         ProcessStart(pid_t pid);
+constexpr size_t kTerminals = 4096;
+struct Terminal {
+  FileOwner owner;
+  int32_t   keeper;
+  int32_t   fd;
+  uint64_t  start_time;
+};
 constexpr size_t   kSlots     = 1 << 19;
 constexpr size_t   kProcesses = 16384;
 constexpr uint64_t kMagic     = 0x314154454d444e41ULL;
@@ -40,14 +48,15 @@ inline bool SameBirth(const FileOwner& a, const FileOwner& b) {
 }  // namespace ownership_detail
 
 struct OwnershipStore::Shared {
-  uint64_t     magic;
-  uint64_t     version;
-  uint64_t     sequence;
-  uint64_t     checkpoint;
-  bool         dirty;
-  uint32_t     failed;
-  FileOwner    files[ownership_detail::kSlots];
-  ProcessOwner processes[ownership_detail::kProcesses];
+  uint64_t                   magic;
+  uint64_t                   version;
+  uint64_t                   sequence;
+  uint64_t                   checkpoint;
+  bool                       dirty;
+  uint32_t                   failed;
+  FileOwner                  files[ownership_detail::kSlots];
+  ProcessOwner               processes[ownership_detail::kProcesses];
+  ownership_detail::Terminal terminals[ownership_detail::kTerminals];
 };
 
 }  // namespace andlify

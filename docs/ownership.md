@@ -87,3 +87,27 @@ Host regression checks (no Android device required):
 ```sh
 python3 tests/ownership_test.py
 ```
+
+## Pseudoterminals
+
+App-owned slave terminals on devpts have virtual chown/chmod, access/open
+checks, and stat/fstat/statx ownership. The Android owner and mode remain
+unchanged. Other device files continue to use host behavior. This allows
+programs such as sudo to assign a terminal to the command's virtual user and
+the guest tty group without attempting a privileged Android chown.
+
+Terminal metadata lives in a separate shared table (4,096 entries), never in
+the snapshot or journal. The tracer that first records a terminal retains an
+O_PATH descriptor, which pins its inode without keeping the terminal session
+alive. Each lookup validates the keeper's PID/start time and the pinned inode's
+link count. When devpts removes the slave node, the old metadata is rejected;
+a replacement at the same path or inode number receives fresh metadata. Stale
+pins are closed during subsequent terminal operations, or at tracer teardown.
+Metadata is discarded when the keeper exits, and unlinked terminals no longer
+have a virtual ownership override. This differs from rootfs regular files,
+whose ownership remains available for open unlinked descriptors.
+
+Restart all Andlify sessions after updating: the shared table layout changed.
+Regular-file inode reuse still requires the precautions described above when
+birth timestamps are unavailable; the terminal handling does not remove that
+existing limitation.

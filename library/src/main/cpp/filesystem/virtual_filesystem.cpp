@@ -270,6 +270,7 @@ bool PrepareFileOperation(pid_t pid, uint64_t syscall, uint64_t* a,
       return false;
   }
   std::string path;
+  bool        outside = false;
   if (fd) {
     path = "/proc/" + std::to_string(pid) + "/fd/" + std::to_string(a[0]);
     char          buffer[4096];
@@ -279,8 +280,7 @@ bool PrepareFileOperation(pid_t pid, uint64_t syscall, uint64_t* a,
       return true;
     }
     std::string target(buffer, n);
-    if (!Managed(store, target))
-      return false;
+    outside = !Managed(store, target);
   } else if (!resolve(path_arg, dir_arg, follow, &path)) {
     *result = -(errno ? errno : EFAULT);
     return true;
@@ -288,26 +288,36 @@ bool PrepareFileOperation(pid_t pid, uint64_t syscall, uint64_t* a,
   if (!fd && path.rfind("/proc/" + std::to_string(pid) + "/fd/", 0) == 0) {
     char          target[4096];
     const ssize_t n = readlink(path.c_str(), target, sizeof(target));
-    if (n > 0 && Managed(store, std::string(target, n)))
-      fd = true;
+    if (n > 0) {
+      fd      = true;
+      outside = !Managed(store, std::string(target, n));
+    }
   }
-  if (!fd && !Managed(store, path))
-    return false;
+  FileOwner owner;
+  bool      terminal = false;
+  if (outside || (!fd && !Managed(store, path))) {
+    if (!store.TerminalOwner(path, fd || follow, &owner)) {
+      if (errno == ENOTTY)
+        return false;
+      *result = -errno;
+      return true;
+    }
+    terminal = true;
+  }
   auto fail = [&](int error) {
     *result = -error;
     return true;
   };
-  int error = fd ? 0 : Search(store, path, c);
+  int error = fd || terminal ? 0 : Search(store, path, c);
   if (error)
     return fail(error);
-  FileOwner owner;
-  bool      exists;
-  if (fd) {
+  bool exists = terminal;
+  if (!terminal && fd) {
     struct stat st{};
     if (stat(path.c_str(), &st) != 0)
       return fail(errno);
     exists = store.Lookup(st.st_dev, st.st_ino, &owner);
-  } else
+  } else if (!terminal)
     exists = Owner(store, path, &owner);
   if (!exists && errno != ENOENT)
     return fail(errno);
@@ -330,7 +340,11 @@ bool PrepareFileOperation(pid_t pid, uint64_t syscall, uint64_t* a,
       owner.gid = gid;
     if (!S_ISDIR(owner.mode) && (uid != UINT32_MAX || gid != UINT32_MAX))
       owner.mode &= ~(S_ISUID | S_ISGID);
-    if (!store.Set(owner, true, &previous))
+    if (terminal) {
+      auto expected = previous;
+      if (!store.TerminalOwner(path, fd || follow, &expected, &owner))
+        return fail(errno);
+    } else if (!store.Set(owner, true, &previous))
       return fail(errno);
     *result = 0;
     return true;
@@ -349,9 +363,14 @@ bool PrepareFileOperation(pid_t pid, uint64_t syscall, uint64_t* a,
     if (c.uid != 0 && !Group(c, owner.gid))
       mode &= ~S_ISGID;
     owner.mode = (owner.mode & S_IFMT) | mode;
-    if (!store.Set(owner, true, &previous))
+    if (terminal) {
+      auto expected = previous;
+      if (!store.TerminalOwner(path, fd || follow, &expected, &owner))
+        return fail(errno);
+    } else if (!store.Set(owner, true, &previous))
       return fail(errno);
-    if (chmod(path.c_str(), mode | (S_ISDIR(owner.mode) ? 0700 : 0600)) != 0)
+    if (!terminal &&
+        chmod(path.c_str(), mode | (S_ISDIR(owner.mode) ? 0700 : 0600)) != 0)
       return fail(errno);
     *result = 0;
     return true;
