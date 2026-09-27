@@ -209,21 +209,24 @@ bool OwnershipStore::Lookup(uint64_t device, uint64_t inode, FileOwner* owner) {
     return found;
   }
 }
-bool OwnershipStore::Identify(const std::string& path, FileOwner* owner) {
+bool OwnershipStore::Identify(
+    const std::string& path, FileOwner* owner, bool follow) {
   struct stat st{};
-  if (lstat(path.c_str(), &st) != 0)
+  if (fstatat(AT_FDCWD, path.c_str(), &st, follow ? 0 : AT_SYMLINK_NOFOLLOW) !=
+      0)
     return false;
   struct statx sx{};
-  // Inode numbers alone cannot distinguish reuse after an offline deletion.
-  if (syscall(SYS_statx, AT_FDCWD, path.c_str(), AT_SYMLINK_NOFOLLOW,
-          STATX_BTIME, &sx) != 0 ||
-      !(sx.stx_mask & STATX_BTIME)) {
-    errno = ENOTSUP;
+  const int    result = syscall(SYS_statx, AT_FDCWD, path.c_str(),
+      follow ? 0 : AT_SYMLINK_NOFOLLOW, STATX_BTIME, &sx);
+  // Birth time is optional; a usable lstat result must not require statx
+  // support.
+  if (result != 0 && errno != ENOSYS && errno != EOPNOTSUPP &&
+      errno != EINVAL && errno != EPERM && errno != EACCES)
     return false;
-  }
-  *owner = {uint64_t(st.st_dev), uint64_t(st.st_ino),
-      uint64_t(sx.stx_btime.tv_sec), sx.stx_btime.tv_nsec, 0, 0,
-      uint32_t(st.st_mode)};
+  const bool has_birth = result == 0 && (sx.stx_mask & STATX_BTIME);
+  *owner               = {uint64_t(st.st_dev), uint64_t(st.st_ino),
+      has_birth ? uint64_t(sx.stx_btime.tv_sec) : 0,
+      has_birth ? sx.stx_btime.tv_nsec : 0, 0, 0, uint32_t(st.st_mode)};
   return true;
 }
 bool OwnershipStore::SetPath(
@@ -326,9 +329,20 @@ bool OwnershipStore::Scan() {
     bool           widen =
         !S_ISLNK(current.mode) && (current.mode & required) != required;
     FileOwner saved;
-    if (Lookup(current.device, current.inode, &saved) &&
-        SameBirth(saved, current))
-      current = saved;
+    if (Lookup(current.device, current.inode, &saved)) {
+      const bool saved_birth = saved.birth_seconds || saved.birth_nanoseconds;
+      const bool current_birth =
+          current.birth_seconds || current.birth_nanoseconds;
+      if (!saved_birth || !current_birth || SameBirth(saved, current)) {
+        current.uid  = saved.uid;
+        current.gid  = saved.gid;
+        current.mode = saved.mode;
+        if (!current_birth) {
+          current.birth_seconds     = saved.birth_seconds;
+          current.birth_nanoseconds = saved.birth_nanoseconds;
+        }
+      }
+    }
     if (S_ISDIR(current.mode) && widen) {
       // Preserve the original mode before making a directory traversable.
       if (!Set(current) ||

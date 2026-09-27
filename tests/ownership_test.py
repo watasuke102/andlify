@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+import errno
 import pathlib
 import subprocess
 import tempfile
@@ -7,6 +8,10 @@ SOURCE = r'''
 #include "ownership/ownership_store.h"
 #include "filesystem/virtual_filesystem.h"
 #include <cassert>
+#include <cstdarg>
+#include <cstdlib>
+#include <linux/stat.h>
+#include <sys/syscall.h>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
@@ -15,8 +20,34 @@ SOURCE = r'''
 #include <unistd.h>
 using namespace andlify;
 namespace fs = std::filesystem;
+int statx_error = 0;
+extern "C" long __real_syscall(long, ...);
+extern "C" long __wrap_syscall(long number, ...) {
+  va_list args;
+  va_start(args, number);
+  int dir = va_arg(args, int);
+  const char* path = va_arg(args, const char*);
+  if (number == SYS_statx) {
+    int flags = va_arg(args, int);
+    unsigned mask = va_arg(args, unsigned);
+    auto* result = va_arg(args, struct statx*);
+    va_end(args);
+    if (statx_error > 0) { errno = statx_error; return -1; }
+    long status = __real_syscall(number, dir, path, flags, mask, result);
+    if (status == 0 && statx_error == -1) result->stx_mask &= ~STATX_BTIME;
+    return status;
+  }
+  assert(number == SYS_renameat2);
+  int target_dir = va_arg(args, int);
+  const char* target = va_arg(args, const char*);
+  unsigned flags = va_arg(args, unsigned);
+  va_end(args);
+  return __real_syscall(number, dir, path, target_dir, target, flags);
+}
 int main(int argc, char** argv) {
-  assert(argc == 2);
+  assert(argc == 3);
+  statx_error = std::atoi(argv[2]);
+  const int original_statx_error = statx_error;
   std::string root = argv[1];
   fs::create_directories(root+"/etc");
   fs::create_directories(root+"/tmp");
@@ -25,6 +56,13 @@ int main(int argc, char** argv) {
   std::ofstream(root+"/etc/group") << "root:x:0:\n";
   std::ofstream(root+"/file") << "test";
   std::ofstream(root+"/readonly") << "test";assert(chmod((root+"/readonly").c_str(),0444)==0);
+  {
+    OwnershipStore store;FileOwner owner;
+    statx_error = EIO;
+    assert(!store.Identify(root+"/file",&owner) && errno==EIO);
+    statx_error = original_statx_error;
+    assert(!store.Identify(root+"/missing",&owner) && errno==ENOENT);
+  }
   FileOwner file;
   {
     OwnershipStore store;
@@ -105,6 +143,18 @@ int main(int argc, char** argv) {
     assert(store.Checkpoint());
     read=file;read.uid=4321;assert(store.Set(read));
   }
+  // Losing birth-time support must not reset persisted ownership or modes.
+  statx_error = -1;
+  {
+    OwnershipStore store;assert(store.Open(root));FileOwner read;
+    assert(store.Lookup(file.device,file.inode,&read));assert(read.uid==4321);
+  }
+  statx_error = 0;
+  {
+    OwnershipStore store;assert(store.Open(root));FileOwner read;
+    assert(store.Lookup(file.device,file.inode,&read));assert(read.uid==4321);
+  }
+  statx_error = original_statx_error;
   // A short trailing write must not discard complete preceding records.
   {std::ofstream log(root+".andlify-owners/journal",std::ios::app|std::ios::binary);log<<"short";}
   {
@@ -141,6 +191,8 @@ with tempfile.TemporaryDirectory(prefix="andlify-ownership-") as tmp:
                     str(source), str(cpp / "ownership/ownership_store.cpp"),
                     str(cpp / "ownership/ownership_persistence.cpp"), str(cpp / "ownership/user_setup.cpp"),
                     str(cpp / "filesystem/virtual_filesystem.cpp"),
-                    str(cpp / "ptrace_memory.cpp"), "-o", str(tmp / "test")], check=True)
-    subprocess.run([str(tmp / "test"), str(tmp / "root")], check=True, timeout=60)
+                    str(cpp / "ptrace_memory.cpp"), "-Wl,--wrap=syscall", "-o", str(tmp / "test")], check=True)
+    for error in (0, -1, errno.ENOSYS, errno.EOPNOTSUPP, errno.EINVAL, errno.EPERM, errno.EACCES):
+        subprocess.run([str(tmp / "test"), str(tmp / f"root-{error}"), str(error)],
+                       check=True, timeout=60)
 print("ownership persistence, shared visibility, permissions, recovery: passed")

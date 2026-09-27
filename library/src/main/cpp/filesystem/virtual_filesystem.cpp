@@ -526,16 +526,11 @@ bool FinishFileOperation(pid_t pid, int64_t result, OwnershipStore& store,
     path = "/proc/" + std::to_string(pid) + "/fd/" + std::to_string(result);
   FileOwner owner;
   if (pending->open) {
-    struct stat st{};
-    if (stat(path.c_str(), &st) != 0)
+    if (!store.Identify(path, &owner, true))
       return false;
-    struct statx sx{};
-    if (syscall(SYS_statx, AT_FDCWD, path.c_str(), 0, STATX_BTIME, &sx) != 0 ||
-        !(sx.stx_mask & STATX_BTIME))
-      return false;
-    owner = {uint64_t(st.st_dev), uint64_t(st.st_ino),
-        uint64_t(sx.stx_btime.tv_sec), sx.stx_btime.tv_nsec, pending->owner.uid,
-        pending->owner.gid, pending->owner.mode};
+    owner.uid  = pending->owner.uid;
+    owner.gid  = pending->owner.gid;
+    owner.mode = pending->owner.mode;
     if (!store.Set(owner) ||
         chmod(path.c_str(), (owner.mode & 07777) | 0600) != 0)
       return false;

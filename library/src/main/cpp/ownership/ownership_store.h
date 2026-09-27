@@ -35,10 +35,10 @@ class OwnershipStore {
   OwnershipStore& operator=(const OwnershipStore&) = delete;
   bool            Open(const std::string& root, bool prepare_user = false);
   bool            Lookup(uint64_t device, uint64_t inode, FileOwner* owner);
-  bool            Identify(const std::string& path, FileOwner* owner);
-  bool            Set(const FileOwner& owner, bool durable = true,
+  bool Identify(const std::string& path, FileOwner* owner, bool follow = false);
+  bool Set(const FileOwner& owner, bool durable = true,
       const FileOwner* previous = nullptr);
-  bool            SetPath(
+  bool SetPath(
       const std::string& path, uint32_t uid, uint32_t gid, mode_t mode);
   bool               Create(const std::string& path, const FileOwner& owner,
       const std::string& target = {});

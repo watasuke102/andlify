@@ -38,9 +38,14 @@ Ownership is stored beside the rootfs in `<canonical-rootfs>.andlify-owners`:
 The table records virtual UID, GID and mode per device/inode. Hard links share
 an entry and rename preserves it. Unlinked entries remain available for open
 file descriptors and are pruned when the next session group starts. Startup
-uses `statx` birth timestamps to reject stale records for reused inode numbers;
-the rootfs filesystem must support `STATX_BTIME` and atomic rename within the
-rootfs/metadata filesystem. Filesystem metadata must not be changed externally
+uses `statx` birth timestamps, when available, to reject stale records for
+reused inode numbers. If birth time or `statx` is unavailable, ownership falls
+back to device/inode identity. In this mode, inode reuse after external deletion
+and recreation between sessions cannot reliably be detected. Do not modify the
+rootfs externally, including while sessions are stopped, in this mode. Existing
+ownership survives changes in birth-time availability. Other stat errors (such
+as I/O errors) still fail initialization. Atomic rename within the rootfs/metadata
+filesystem is required. Filesystem metadata must not be changed externally
 while sessions are running. Host-side copies of the rootfs and database are
 not a portable ownership backup: inode identities change. Archives produced
 inside the virtual environment can preserve the virtual identities.
