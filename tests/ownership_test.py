@@ -65,6 +65,7 @@ int main(int argc, char** argv) {
     statx_error = original_statx_error;
     assert(!store.Identify(root+"/missing",&owner) && errno==ENOENT);
   }
+  FileOwner privileged;
   FileOwner file;
   {
     OwnershipStore store;
@@ -73,7 +74,7 @@ int main(int argc, char** argv) {
     FileOwner original;assert(store.Lookup(imported.device,imported.inode,&original));assert((original.mode&0777)==0444);
     assert(store.Identify(root+"/home/user",&imported));assert(store.Lookup(imported.device,imported.inode,&original));
     assert(original.uid==1000 && (original.mode&0777)==0700);
-    std::ifstream shadow(root+"/etc/shadow");std::string shadow_text;std::getline(shadow,shadow_text);assert(shadow_text.rfind("user:!:",0)==0);
+    std::ifstream shadow(root+"/etc/shadow");std::string shadow_text;std::getline(shadow,shadow_text);assert(shadow_text.rfind("user:$6$andlify-user$",0)==0);
     assert(store.Identify(root+"/file",&file));
     file.uid=1000;file.gid=1000;file.mode=S_IFREG|0640;
     assert(store.Set(file));
@@ -147,6 +148,18 @@ int main(int argc, char** argv) {
       assert(connect(client,reinterpret_cast<sockaddr*>(&address),sizeof(address))==0);
       close(client);close(listener);
     }
+    {
+      path=root+"/privileged";
+      std::ofstream(path)<<"test";
+      assert(chmod(path.c_str(),0755)==0);
+      assert(store.Identify(path,&privileged));
+      privileged.uid=0;privileged.gid=0;privileged.mode=S_IFREG|04755;
+      assert(store.Set(privileged));
+      args[0]=reinterpret_cast<uint64_t>(path.c_str());
+      assert(!PrepareFileOperation(getpid(),221,args,user,store,resolver,&pending,&result));
+      assert(store.Lookup(privileged.device,privileged.inode,&read));
+      assert(read.uid==0 && (read.mode&07777)==04755);
+    }
     for(int attempt=0;attempt<8;++attempt) {
       auto writer=fork();assert(writer>=0);
       if(writer==0) {
@@ -168,11 +181,15 @@ int main(int argc, char** argv) {
   {
     OwnershipStore store;assert(store.Open(root));FileOwner read;
     assert(store.Lookup(file.device,file.inode,&read));assert(read.uid==4321);
+    assert(store.Lookup(privileged.device,privileged.inode,&read));
+    assert(read.uid==0 && (read.mode&07777)==04755);
   }
   statx_error = 0;
   {
     OwnershipStore store;assert(store.Open(root));FileOwner read;
     assert(store.Lookup(file.device,file.inode,&read));assert(read.uid==4321);
+    assert(store.Lookup(privileged.device,privileged.inode,&read));
+    assert(read.uid==0 && (read.mode&07777)==04755);
   }
   statx_error = original_statx_error;
   // A short trailing write must not discard complete preceding records.

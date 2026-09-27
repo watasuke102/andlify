@@ -13,9 +13,14 @@
 namespace andlify {
 bool PrepareUser(OwnershipStore& store) {
   for (const auto& item : std::vector<std::pair<std::string, std::string>>{
-           {"passwd",  "user:x:1000:1000:User:/home/user:/bin/sh"},
-           {"group",   "user:x:1000:"                            },
-           {"shadow",  "user:!:0:0:99999:7:::"                   },
+           {"passwd", "user:x:1000:1000:User:/home/user:/bin/sh"},
+           {"group", "user:x:1000:"},
+           {
+               "shadow",
+               // clang-format off
+               "user:$6$andlify-user$qYg/bw1kksPlfsdv8xgkpqH6QyzOyKiS55VgOKTvcRrbbdQXsPLWkluRpFXEywk5JPN.2A1TxrH6mEjznGNLH.:20000:0:99999:7:::"
+               // clang-format off
+            },
            {"gshadow", "user:!::"                                }
   }) {
     std::string   path = store.root() + "/etc/" + item.first;

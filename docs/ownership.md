@@ -2,8 +2,10 @@
 
 New sessions run as virtual UID/GID **1000:1000**, named `user`, with
 `HOME=/home/user` and `XDG_RUNTIME_DIR=/run/user/1000`. The first session
-creates the account, a locked password entry, the home directory, and the
-0700 runtime directory. Conflicting existing account names/IDs cause startup
+creates the account with initial password `user` (stored as a SHA-512 crypt
+hash), the home directory, and the
+0700 runtime directory. Existing password entries, including locked entries,
+are preserved. Conflicting existing account names/IDs cause startup
 to fail rather than silently changing an existing account. Existing `/root`
 configuration is retained; it is not copied into the new user's home.
 
