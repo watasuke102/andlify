@@ -120,6 +120,88 @@ int main(int argc, char** argv) {
     assert(FinishFileOperation(getpid(),fd,store,user,&pending));close(fd);
     FileOwner created;assert(store.Identify(path,&created));assert(store.Lookup(created.device,created.inode,&read));
     assert(read.uid==1000 && (read.mode&0777)==0644);
+    {
+      const auto saved_path = path;
+      for (const auto& suffix : {"", "/", "///"}) {
+        path = root + "/home/user/directory" + std::to_string(std::strlen(suffix)) + suffix;
+        args[2] = 0777;
+        assert(PrepareFileOperation(getpid(),34,args,user,store,resolver,&pending,&result));
+        assert(result == 0);
+        FileOwner directory;
+        assert(store.Identify(path,&directory));
+        assert(store.Lookup(directory.device,directory.inode,&directory));
+        assert(S_ISDIR(directory.mode) && (directory.mode & 07777) == 0755);
+        assert(directory.uid == 1000 && directory.gid == 1000);
+        assert(PrepareFileOperation(getpid(),34,args,user,store,resolver,&pending,&result));
+        assert(result == -EEXIST);
+      }
+      path = root + "/home/user/missing-parent/child/";
+      assert(PrepareFileOperation(getpid(),34,args,user,store,resolver,&pending,&result));
+      assert(result == -ENOENT);
+      path = root + "/etc/forbidden-directory/";
+      assert(PrepareFileOperation(getpid(),34,args,user,store,resolver,&pending,&result));
+      assert(result == -EACCES);
+      path = root + "/home/user/dangling-directory";
+      assert(symlink("absent-directory", path.c_str()) == 0);
+      path += "/";
+      assert(PrepareFileOperation(getpid(),34,args,user,store,resolver,&pending,&result));
+      assert(result == -EEXIST);
+      assert(!fs::exists(root + "/home/user/absent-directory"));
+      path = saved_path;
+    }
+    {
+      auto timestamp_resolver = [&](int path_arg, int dir_arg, bool follow, std::string* out) {
+        assert(path_arg == 1 && dir_arg == 0 && follow);
+        if (!args[1]) { errno = EFAULT; return false; }
+        *out = path;
+        return true;
+      };
+      timespec times[2]{{123456789, 123456789}, {987654321, 987654321}};
+      const auto saved_path = path;
+      for (bool directory : {false, true}) {
+        path = root + (directory ? "/home/user/timestamp-dir" : "/home/user/timestamp-file");
+        FileOwner timestamp_owner;
+        timestamp_owner.uid = 1000;
+        timestamp_owner.gid = 1000;
+        timestamp_owner.mode = directory ? S_IFDIR | 0700 : S_IFREG | 0600;
+        assert(store.Create(path, timestamp_owner));
+        int timestamp_fd = open(path.c_str(), O_RDONLY);
+        assert(timestamp_fd >= 0);
+        args[0] = timestamp_fd;
+        args[1] = 0;
+        args[2] = reinterpret_cast<uint64_t>(times);
+        args[3] = 0;
+        assert(!PrepareFileOperation(getpid(),88,args,user,store,timestamp_resolver,&pending,&result));
+        assert(futimens(timestamp_fd, times) == 0);
+        struct stat timestamps{};
+        assert(fstat(timestamp_fd, &timestamps) == 0);
+        assert(timestamps.st_atim.tv_sec == times[0].tv_sec && timestamps.st_atim.tv_nsec == times[0].tv_nsec);
+        assert(timestamps.st_mtim.tv_sec == times[1].tv_sec && timestamps.st_mtim.tv_nsec == times[1].tv_nsec);
+        FileCredentials other{2000,2000,groups,0022};
+        assert(PrepareFileOperation(getpid(),88,args,other,store,timestamp_resolver,&pending,&result));
+        assert(result == -EPERM);
+        assert(!PrepareFileOperation(getpid(),88,args,administrator,store,timestamp_resolver,&pending,&result));
+        args[2] = 0;
+        assert(PrepareFileOperation(getpid(),88,args,other,store,timestamp_resolver,&pending,&result));
+        assert(result == -EACCES);
+        assert(!PrepareFileOperation(getpid(),88,args,user,store,timestamp_resolver,&pending,&result));
+        args[0] = AT_FDCWD;
+        args[1] = reinterpret_cast<uint64_t>(path.c_str());
+        args[2] = reinterpret_cast<uint64_t>(times);
+        assert(!PrepareFileOperation(getpid(),88,args,user,store,timestamp_resolver,&pending,&result));
+        args[0] = timestamp_fd;
+        args[1] = 0;
+        if (!directory) {
+          assert(unlink(path.c_str()) == 0);
+          assert(!PrepareFileOperation(getpid(),88,args,user,store,timestamp_resolver,&pending,&result));
+          assert(futimens(timestamp_fd, times) == 0);
+        }
+        close(timestamp_fd);
+        assert(PrepareFileOperation(getpid(),88,args,user,store,timestamp_resolver,&pending,&result));
+        assert(result == -EBADF);
+      }
+      path = saved_path;
+    }
     FileOwner stale=read;read.gid=555;assert(store.Set(read));
     stale.uid=77;assert(!store.Set(stale,true,&created));assert(errno==EAGAIN);
     FileOwner sticky;sticky.uid=1234;sticky.gid=1234;sticky.mode=S_IFREG|0600;

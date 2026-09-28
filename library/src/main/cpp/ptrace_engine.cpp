@@ -2422,6 +2422,10 @@ bool HandleVirtualFiles(pid_t pid, const std::string& root,
     std::string original;
     if (!ReadTraceeCString(pid, regs->regs[arg], kPathReadLimit, &original))
       return false;
+    // mkdir must reject a final symlink rather than create its missing target.
+    if (regs->regs[8] == kSysMkdirat) {
+      while (original.size() > 1 && original.back() == '/') original.pop_back();
+    }
     if (original.empty()) {
       if (dir_arg < 0)
         return false;
@@ -3115,6 +3119,8 @@ int TracerMain(const std::string& extract_dst_path,
 
   std::unordered_map<pid_t, TraceeState> states;
   std::unordered_set<pid_t>              tracked_pids;
+  std::unordered_map<pid_t, int>         pending_child_stops;
+  std::deque<std::pair<pid_t, int>>      ready_stops;
 
   TraceeState initial_state;
   initial_state.real_uid      = initial_state.effective_uid =
@@ -3137,8 +3143,15 @@ int TracerMain(const std::string& extract_dst_path,
   ResumeSyscall(tracee_pid, 0);
 
   while (!tracked_pids.empty()) {
-    int         wait_status = 0;
-    const pid_t pid         = waitpid(-1, &wait_status, __WALL);
+    int   wait_status = 0;
+    pid_t pid;
+    if (ready_stops.empty()) {
+      pid = waitpid(-1, &wait_status, __WALL);
+    } else {
+      pid         = ready_stops.front().first;
+      wait_status = ready_stops.front().second;
+      ready_stops.pop_front();
+    }
     if (pid < 0) {
       if (errno == EINTR) {
         continue;
@@ -3172,6 +3185,13 @@ int TracerMain(const std::string& extract_dst_path,
       continue;
     }
 
+    // Resuming a newborn before its parent's event loses inherited state and
+    // lets the later clone event reset an already running syscall sequence.
+    if (WSTOPSIG(wait_status) == SIGSTOP && states.find(pid) == states.end()) {
+      pending_child_stops.emplace(pid, wait_status);
+      continue;
+    }
+
     auto&                       state = states[pid];
     const andlify::ProcessOwner identity{pid, state.real_uid,
         state.effective_uid, state.real_gid, state.effective_gid};
@@ -3194,6 +3214,8 @@ int TracerMain(const std::string& extract_dst_path,
     const int      signal_number = WSTOPSIG(wait_status);
     const unsigned event         = static_cast<unsigned>(wait_status) >> 16U;
     if (signal_number == (SIGTRAP | 0x80)) {
+      user_pt_regs        regs{};
+      const bool          has_regs                = GetRegs(pid, &regs);
       bool                is_syscall_entry        = state.expect_entry;
       bool                syscall_direction_known = false;
       ptrace_syscall_info syscall_info{};
@@ -3207,6 +3229,11 @@ int TracerMain(const std::string& extract_dst_path,
       } else if (syscall_info_size > 0 &&
                  syscall_info.op == PTRACE_SYSCALL_INFO_EXIT) {
         is_syscall_entry        = false;
+        syscall_direction_known = true;
+      } else if (has_regs && regs.regs[7] <= 1) {
+        // Alternating stops can desynchronize after clone or SIGSYS on kernels
+        // without GET_SYSCALL_INFO; arm64 exposes the stop direction in x7.
+        is_syscall_entry        = regs.regs[7] == 0;
         syscall_direction_known = true;
       }
 
@@ -3230,8 +3257,7 @@ int TracerMain(const std::string& extract_dst_path,
         continue;
       }
 
-      user_pt_regs regs{};
-      if (GetRegs(pid, &regs)) {
+      if (has_regs) {
         if (!is_syscall_entry) {
           RestoreOpenPermission(&state);
           if (!andlify::FinishFileOperation(pid,
@@ -3324,6 +3350,12 @@ int TracerMain(const std::string& extract_dst_path,
               child_state.real_gid, child_state.effective_gid});
           states.insert_or_assign(
               static_cast<pid_t>(new_pid), std::move(child_state));
+          const auto pending =
+              pending_child_stops.find(static_cast<pid_t>(new_pid));
+          if (pending != pending_child_stops.end()) {
+            ready_stops.emplace_back(pending->first, pending->second);
+            pending_child_stops.erase(pending);
+          }
         }
       } else if (event == PTRACE_EVENT_EXEC) {
         unsigned long previous_tid = 0;

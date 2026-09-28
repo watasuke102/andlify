@@ -592,7 +592,8 @@ bool ExtractRootfs(
       return false;
     owner.uid  = saved.uid;
     owner.gid  = saved.gid;
-    owner.mode = saved.mode;
+    // Tar hard-link entries may omit the type; do not erase the inode's type.
+    owner.mode = (owner.mode & S_IFMT) | (saved.mode & 07777);
     if (!ownership.Set(owner, false))
       return false;
   }

@@ -234,6 +234,15 @@ bool PrepareFileOperation(pid_t pid, uint64_t syscall, uint64_t* a,
       follow   = !(a[3] & AT_SYMLINK_NOFOLLOW);
       break;
     case kUtimensat:
+      // futimens passes a null pathname, which must not be read as a string.
+      if (!a[1]) {
+        fd = true;
+        break;
+      }
+      path_arg = 1;
+      dir_arg  = 0;
+      follow   = !(a[3] & AT_SYMLINK_NOFOLLOW);
+      break;
     case kStatx:
     case kFaccessat2:
     case kFchmodat2:
@@ -284,6 +293,10 @@ bool PrepareFileOperation(pid_t pid, uint64_t syscall, uint64_t* a,
   } else if (!resolve(path_arg, dir_arg, follow, &path)) {
     *result = -(errno ? errno : EFAULT);
     return true;
+  }
+  // A trailing separator must not make mkdir's missing target its own parent.
+  if (syscall == kMkdirat) {
+    while (path.size() > 1 && path.back() == '/') path.pop_back();
   }
   if (!fd && path.rfind("/proc/" + std::to_string(pid) + "/fd/", 0) == 0) {
     char          target[4096];
