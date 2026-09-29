@@ -196,6 +196,8 @@ struct TraceeState {
   bool                               emulated_user_namespace    = false;
   bool                               pending_netlink_route_fd   = false;
   bool                               pending_openat2_retry      = false;
+  // The retried openat carries a rootfs path already resolved at openat2.
+  bool                               retrying_openat2           = false;
   uint64_t                           emulated_return            = 0;
   uint64_t                           pending_openat_dirfd       = 0;
   uint64_t                           pending_openat_path        = 0;
@@ -2899,6 +2901,7 @@ bool SuppressBlockedSyscall(pid_t pid, TraceeState* state) {
     state->has_emulated_return   = false;
     state->emulated_return       = 0;
     state->pending_openat2_retry = false;
+    state->retrying_openat2      = true;
     __android_log_print(ANDROID_LOG_VERBOSE, kLogTag,
         "retrying blocked openat2 as openat pid=%d", pid);
     return true;
@@ -3283,8 +3286,14 @@ int TracerMain(const std::string& extract_dst_path,
         if (is_syscall_entry || !syscall_direction_known) {
           RewriteSockaddrIfNeeded(pid, normalized_rootfs, &regs);
         }
-        if (is_syscall_entry) {
+        if (is_syscall_entry && state.retrying_openat2 &&
+            regs.regs[8] == kSysOpenat) {
+          // Rewriting the resolved path again would prefix it with the
+          // emulated new root, and its access was checked at openat2 entry.
+          state.retrying_openat2 = false;
+        } else if (is_syscall_entry) {
           state.pending_openat2_retry = false;
+          state.retrying_openat2      = false;
           if (regs.regs[8] == kSysSendmsg) {
             RewriteUnixCredentials(
                 pid, regs.regs[1], app_uid, app_gid, states, true);
@@ -3342,6 +3351,7 @@ int TracerMain(const std::string& extract_dst_path,
           child_state.has_emulated_return   = false;
           child_state.emulated_return       = 0;
           child_state.pending_openat2_retry = false;
+          child_state.retrying_openat2      = false;
           child_state.emulated_mountinfo_path.clear();
           child_state.pending_open_permission_path.clear();
           child_state.pending_open_permission_mode = 0;
