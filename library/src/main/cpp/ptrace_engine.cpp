@@ -1379,6 +1379,14 @@ void RedirectEmulatedMountInfo(pid_t pid, const std::string& normalized_rootfs,
     written += static_cast<size_t>(result);
   }
   close(fd);
+  // Like /proc/self/mountinfo, it must be readable by any virtual user.
+  if (ownership == nullptr ||
+      !ownership->SetPath(state->emulated_mountinfo_path, 0, 0, 0444)) {
+    __android_log_print(ANDROID_LOG_WARN, kLogTag,
+        "Failed to set emulated mountinfo ownership pid=%d path=%s: %s", pid,
+        state->emulated_mountinfo_path.c_str(), strerror(errno));
+    return;
+  }
 
   __android_log_print(ANDROID_LOG_VERBOSE, kLogTag,
       "Redirecting mountinfo pid=%d mounts=%zu path=%s", pid,
@@ -2461,6 +2469,13 @@ bool HandleVirtualFiles(pid_t pid, const std::string& root,
         }
         return true;
       }
+    }
+    // Paths already in the rootfs are injected by the tracer after resolution
+    // (e.g. the emulated mountinfo); resolving them again as virtual paths
+    // would look up nonexistent directories such as <rootfs>/data.
+    if (original == root || original.rfind(root + "/", 0) == 0) {
+      *path = original;
+      return true;
     }
     if (!IsAbsoluteUnixPath(original)) {
       std::string base;
