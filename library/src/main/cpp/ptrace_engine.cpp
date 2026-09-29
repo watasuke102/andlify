@@ -3292,11 +3292,13 @@ int TracerMain(const std::string& extract_dst_path,
           RedirectUserNamespaceControlFile(
               pid, normalized_rootfs, state, &regs);
           RedirectEmulatedMountInfo(pid, normalized_rootfs, &state, &regs);
-          if (!HandleVirtualFiles(
-                  pid, normalized_rootfs, states, &state, &regs) &&
-              !MaybeEmulateNamespaceSyscall(pid, &state, &regs) &&
+          // Mount emulation runs first because nodes left in an emulated
+          // mount by an earlier sandbox must look newly created to mkdir.
+          if (!MaybeEmulateNamespaceSyscall(pid, &state, &regs) &&
               !MaybeEmulateMountNamespaceOperation(
                   pid, normalized_rootfs, &state, &regs) &&
+              !HandleVirtualFiles(
+                  pid, normalized_rootfs, states, &state, &regs) &&
               !MaybeEmulateNetworkNamespaceOperation(pid, &state, &regs) &&
               !MaybeEmulateGetcwd(pid, normalized_rootfs, &state, &regs) &&
               !MaybeEmulateProcReadlink(
