@@ -231,6 +231,23 @@ struct TraceeState {
   rlimit                                       file_descriptor_limit{};
 };
 
+// Relative paths are resolved from a cwd that is already a rootfs path, where
+// the emulated old root appears beneath the emulated new root.
+std::string MapEmulatedOldRootInRootfs(
+    const TraceeState& state, const std::string& path) {
+  if (state.emulated_old_root.empty()) {
+    return path;
+  }
+  const std::string old_root_in_rootfs =
+      state.emulated_new_root + state.emulated_old_root;
+  if (path != old_root_in_rootfs &&
+      path.rfind(old_root_in_rootfs + "/", 0) != 0) {
+    return path;
+  }
+  const std::string mapped = path.substr(old_root_in_rootfs.size());
+  return mapped.empty() ? "/" : mapped;
+}
+
 std::string ResolveEmulatedBindMounts(
     const TraceeState& state, const std::string& path) {
   std::string resolved_path = path;
@@ -411,10 +428,22 @@ std::string TranslateProcPath(pid_t               pid,
       return path;
     }
   }
-  const auto found = states.find(target);
-  if (found == states.end())
-    return path;
   const std::string suffix = path.substr(separator);
+  const auto        found  = states.find(target);
+  if (found == states.end()) {
+    // Processes traced by another tracer (e.g. separately started commands)
+    // share the rootfs, but their emulated pivot_root state is not shared.
+    andlify::ProcessOwner identity;
+    if (ownership == nullptr || !ownership->Process(target, &identity) ||
+        (suffix != "/root" && suffix.rfind("/root/", 0) != 0))
+      return path;
+    const bool final_root = suffix == "/root";
+    if (root_reference != nullptr)
+      *root_reference = final_root;
+    if (final_root && !follow_final)
+      return path;
+    return final_root ? "/" : suffix.substr(5);
+  }
   if (suffix == "/root" || suffix.rfind("/root/", 0) == 0) {
     const bool final_root = suffix == "/root";
     if (root_reference != nullptr)
@@ -1039,15 +1068,21 @@ bool MaybeEmulateMountNamespaceOperation(pid_t pid,
       if (!ResolveVirtualPathBase(pid, dir_fd, normalized_rootfs, &base_path)) {
         return false;
       }
-      *virtual_path = ResolveVirtualRelativePath(base_path, *virtual_path);
-    }
-    if (!state->emulated_old_root.empty() &&
-        (*virtual_path == state->emulated_old_root ||
-            virtual_path->rfind(state->emulated_old_root + "/", 0) == 0)) {
+      *virtual_path = MapEmulatedOldRootInRootfs(
+          *state, ResolveVirtualRelativePath(base_path, *virtual_path));
+    } else if (!state->emulated_old_root.empty() &&
+               (*virtual_path == state->emulated_old_root ||
+                   virtual_path->rfind(state->emulated_old_root + "/", 0) ==
+                       0)) {
       *virtual_path = virtual_path->substr(state->emulated_old_root.size());
       if (virtual_path->empty()) {
         *virtual_path = "/";
       }
+    } else if (!state->emulated_new_root.empty() &&
+               *virtual_path != normalized_rootfs &&
+               virtual_path->rfind(normalized_rootfs + "/", 0) != 0 &&
+               !IsPassthroughUnixPath(*virtual_path)) {
+      *virtual_path = state->emulated_new_root + *virtual_path;
     }
     *real_path = RewritePathToRootfs(normalized_rootfs,
         ResolveVirtualSymlinks(normalized_rootfs, *virtual_path, false));
@@ -1188,7 +1223,9 @@ bool MaybeEmulateMountNamespaceOperation(pid_t pid,
           if (!ResolveVirtualPathBase(pid, AT_FDCWD, normalized_rootfs, &cwd)) {
             return false;
           }
-          *path = ResolveVirtualRelativePath(cwd, *path);
+          *path = MapEmulatedOldRootInRootfs(
+              *state, ResolveVirtualRelativePath(cwd, *path));
+          return true;
         }
         if (!state->emulated_old_root.empty() &&
             (*path == state->emulated_old_root ||
@@ -2483,7 +2520,14 @@ bool HandleVirtualFiles(pid_t pid, const std::string& root,
               dir_arg < 0 ? AT_FDCWD : static_cast<int>(regs->regs[dir_arg]),
               root, &base))
         return false;
-      original = base + "/" + original;
+      original = MapEmulatedOldRootInRootfs(*state, base + "/" + original);
+    } else if (!state->emulated_old_root.empty() &&
+               (original == state->emulated_old_root ||
+                   original.rfind(state->emulated_old_root + "/", 0) == 0)) {
+      original = original.substr(state->emulated_old_root.size());
+      if (original.empty()) {
+        original = "/";
+      }
     } else if (!state->emulated_new_root.empty() &&
                !IsPassthroughUnixPath(original)) {
       original = state->emulated_new_root + original;
@@ -2552,12 +2596,10 @@ void RewritePathArgument(pid_t pid, const std::string& normalized_rootfs,
     if (base_path.back() != '/') {
       base_path.push_back('/');
     }
-    virtual_path = base_path + virtual_path;
-  }
-
-  if (!state.emulated_old_root.empty() &&
-      (virtual_path == state.emulated_old_root ||
-          virtual_path.rfind(state.emulated_old_root + "/", 0) == 0)) {
+    virtual_path = MapEmulatedOldRootInRootfs(state, base_path + virtual_path);
+  } else if (!state.emulated_old_root.empty() &&
+             (virtual_path == state.emulated_old_root ||
+                 virtual_path.rfind(state.emulated_old_root + "/", 0) == 0)) {
     virtual_path = virtual_path.substr(state.emulated_old_root.size());
     if (virtual_path.empty()) {
       virtual_path = "/";
