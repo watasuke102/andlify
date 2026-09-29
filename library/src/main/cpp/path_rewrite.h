@@ -16,6 +16,11 @@ inline constexpr char kOverflowGidBackingPath[] =
 inline constexpr char kHostnamePath[]        = "/proc/sys/kernel/hostname";
 inline constexpr char kHostnameBackingPath[] = "/tmp/.andlify-kernel-hostname";
 
+// Stand-ins for /proc/<pid>/ns/<type> when the kernel lacks that namespace.
+inline constexpr char kNamespaceFileBackingPath[] = "/tmp/.andlify-namespace";
+inline constexpr char kNamespaceLinkBackingPrefix[] =
+    "/tmp/.andlify-namespace-";
+
 std::string NormalizeRootfsPrefix(const std::string& rootfs_path);
 bool        IsAbsoluteUnixPath(const std::string& path);
 bool        IsPassthroughUnixPath(const std::string& path);

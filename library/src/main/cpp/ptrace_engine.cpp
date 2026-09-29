@@ -174,7 +174,25 @@ constexpr const char* kDefaultEnvironment[][2] = {
 };
 
 constexpr char kInotifyMaxUserWatchesValue[] = "8192\n";
-constexpr char kOverflowIdValue[]            = "65534\n";
+
+struct NamespaceType {
+  const char* name;
+  // Inode of the namespace created at boot (PROC_*_INIT_INO in the kernel).
+  uint32_t    initial_inode;
+  bool        missing = false;
+};
+
+// Namespaces andlify emulates for clone()/unshare() that a kernel may be built
+// without. mnt and net have no fixed initial inode and are always kept as-is.
+NamespaceType emulated_namespace_types[] = {
+    {"cgroup",           0xEFFFFFFB},
+    {"ipc",              0xEFFFFFFF},
+    {"pid",              0xEFFFFFFC},
+    {"pid_for_children", 0xEFFFFFFC},
+    {"user",             0xEFFFFFFD},
+    {"uts",              0xEFFFFFFE},
+};
+constexpr char kOverflowIdValue[] = "65534\n";
 
 struct ProcessExecutable {
   std::shared_ptr<ElfExecutable> image;
@@ -434,6 +452,22 @@ std::string ResolveVirtualRelativePath(
   return result;
 }
 
+// Returns the namespace type if |suffix| is "/ns/<type>" for a namespace type
+// the kernel does not provide.
+const NamespaceType* FindMissingNamespace(std::string_view suffix) {
+  constexpr std::string_view prefix = "/ns/";
+  if (suffix.rfind(prefix, 0) != 0) {
+    return nullptr;
+  }
+  suffix.remove_prefix(prefix.size());
+  for (const NamespaceType& type : emulated_namespace_types) {
+    if (type.missing && suffix == type.name) {
+      return &type;
+    }
+  }
+  return nullptr;
+}
+
 std::string TranslateProcPath(pid_t               pid,
     const std::unordered_map<pid_t, TraceeState>& states, std::string path,
     bool follow_final, bool* root_reference = nullptr) {
@@ -471,7 +505,15 @@ std::string TranslateProcPath(pid_t               pid,
     }
   }
   const std::string suffix = path.substr(separator);
-  const auto        found  = states.find(target);
+  if (const NamespaceType* type = FindMissingNamespace(suffix)) {
+    // Namespace creation is emulated, so programs that check for the
+    // namespace file before cloning must find it too.
+    if (access(path.substr(0, separator).c_str(), F_OK) != 0)
+      return path;
+    return follow_final ? std::string(kNamespaceFileBackingPath) :
+                          std::string(kNamespaceLinkBackingPrefix) + type->name;
+  }
+  const auto found = states.find(target);
   if (found == states.end()) {
     // Processes traced by another tracer (e.g. separately started commands)
     // share the rootfs, but their emulated pivot_root state is not shared.
@@ -3261,6 +3303,7 @@ bool PrepareEmulatedProcFiles(const std::string& normalized_rootfs) {
        sizeof(kInotifyMaxUserWatchesValue) - 1                                                     },
       {kOverflowUidBackingPath,           kOverflowIdValue,            sizeof(kOverflowIdValue) - 1},
       {kOverflowGidBackingPath,           kOverflowIdValue,            sizeof(kOverflowIdValue) - 1},
+      {kNamespaceFileBackingPath,         "",                          0                           },
   };
 
   for (const File& file : files) {
@@ -3310,6 +3353,32 @@ bool PrepareEmulatedProcFiles(const std::string& normalized_rootfs) {
     if (rename(temporary_path.c_str(), backing_path.c_str()) != 0) {
       __android_log_print(ANDROID_LOG_ERROR, kLogTag,
           "Failed to publish proc file: %s (%s)", backing_path.c_str(),
+          strerror(errno));
+      unlink(temporary_path.c_str());
+      return false;
+    }
+  }
+
+  for (NamespaceType& type : emulated_namespace_types) {
+    struct stat       info{};
+    const std::string kernel_path = std::string("/proc/self/ns/") + type.name;
+    type.missing = lstat(kernel_path.c_str(), &info) != 0 && errno == ENOENT;
+    if (!type.missing) {
+      continue;
+    }
+    const std::string backing_path =
+        normalized_rootfs + kNamespaceLinkBackingPrefix + type.name;
+    const std::string temporary_path =
+        backing_path + ".tmp" + std::to_string(getpid());
+    char target[64];
+    snprintf(target, sizeof(target), "%s:[%u]",
+        strcmp(type.name, "pid_for_children") == 0 ? "pid" : type.name,
+        type.initial_inode);
+    unlink(temporary_path.c_str());
+    if (symlink(target, temporary_path.c_str()) != 0 ||
+        rename(temporary_path.c_str(), backing_path.c_str()) != 0) {
+      __android_log_print(ANDROID_LOG_ERROR, kLogTag,
+          "Failed to publish namespace link: %s (%s)", backing_path.c_str(),
           strerror(errno));
       unlink(temporary_path.c_str());
       return false;
