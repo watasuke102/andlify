@@ -15,6 +15,7 @@
 #include <signal.h>
 #include <stddef.h>
 #include <stdint.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/file.h>
@@ -34,6 +35,7 @@
 #include <unistd.h>
 
 #include <algorithm>
+#include <array>
 #include <charconv>
 #include <deque>
 #include <string>
@@ -187,22 +189,33 @@ struct ProcessExecutable {
   }
 };
 
+struct SyscallRecord {
+  uint64_t number = 0;
+  uint64_t args[6]{};
+  int64_t  result   = 0;
+  bool     finished = false;
+};
+
+constexpr size_t kSyscallHistorySize = 32;
+
 struct TraceeState {
-  bool                               expect_entry               = true;
-  bool                               options_applied            = false;
-  bool                               has_emulated_return        = false;
-  bool                               emulated_mount_namespace   = false;
-  bool                               emulated_network_namespace = false;
-  bool                               emulated_user_namespace    = false;
-  bool                               pending_netlink_route_fd   = false;
-  bool                               pending_openat2_retry      = false;
+  bool                               expect_entry                  = true;
+  bool                               options_applied               = false;
+  bool                               has_emulated_return           = false;
+  bool                               emulated_mount_namespace      = false;
+  bool                               emulated_network_namespace    = false;
+  bool                               emulated_user_namespace       = false;
+  bool                               pending_netlink_route_fd      = false;
+  bool                               pending_openat2_retry         = false;
   // The retried openat carries a rootfs path already resolved at openat2.
-  bool                               retrying_openat2           = false;
-  uint64_t                           emulated_return            = 0;
-  uint64_t                           pending_openat_dirfd       = 0;
-  uint64_t                           pending_openat_path        = 0;
-  uint64_t                           pending_openat_flags       = 0;
-  uint64_t                           pending_openat_mode        = 0;
+  bool                               retrying_openat2              = false;
+  uint64_t                           emulated_return               = 0;
+  // Namespace flags removed from an in-flight clone, applied to its child.
+  uint64_t                           pending_clone_namespace_flags = 0;
+  uint64_t                           pending_openat_dirfd          = 0;
+  uint64_t                           pending_openat_path           = 0;
+  uint64_t                           pending_openat_flags          = 0;
+  uint64_t                           pending_openat_mode           = 0;
   std::shared_ptr<ProcessExecutable> executable;
   std::shared_ptr<ProcessExecutable> pending_executable;
   std::string                        pending_open_permission_path;
@@ -226,10 +239,39 @@ struct TraceeState {
   std::unordered_set<std::string>    copied_lock_sources;
   std::unordered_set<std::string>    emulated_mount_nodes;
   std::unordered_set<std::string>    emulated_mount_points{"/"};
-  std::unordered_map<std::string, std::string> emulated_bind_mounts;
-  std::unordered_map<int, uint32_t>            emulated_netlink_route_fds;
-  rlimit                                       file_descriptor_limit{};
+  std::unordered_map<std::string, std::string>   emulated_bind_mounts;
+  std::unordered_map<int, uint32_t>              emulated_netlink_route_fds;
+  rlimit                                         file_descriptor_limit{};
+  // Kept only to explain fatal signals, whose cause is usually a failed call.
+  std::array<SyscallRecord, kSyscallHistorySize> recent_syscalls{};
+  size_t                                         recent_syscall_count = 0;
 };
+
+void RecordSyscallEntry(TraceeState* state, const user_pt_regs& regs) {
+  SyscallRecord& record =
+      state->recent_syscalls[state->recent_syscall_count % kSyscallHistorySize];
+  record.number = regs.regs[8];
+  for (size_t i = 0; i < 6; ++i) {
+    record.args[i] = regs.regs[i];
+  }
+  record.result   = 0;
+  record.finished = false;
+  ++state->recent_syscall_count;
+}
+
+void RecordSyscallResult(TraceeState* state, int64_t result) {
+  if (state->recent_syscall_count == 0) {
+    return;
+  }
+  SyscallRecord& record =
+      state->recent_syscalls[(state->recent_syscall_count - 1) %
+                             kSyscallHistorySize];
+  if (record.finished) {
+    return;
+  }
+  record.result   = result;
+  record.finished = true;
+}
 
 // Relative paths are resolved from a cwd that is already a rootfs path, where
 // the emulated old root appears beneath the emulated new root.
@@ -989,6 +1031,12 @@ bool MaybeEmulateProcReadlink(pid_t pid, const std::string& normalized_rootfs,
   return true;
 }
 
+void EnterEmulatedNamespaces(TraceeState* state, uint64_t namespace_flags) {
+  state->emulated_mount_namespace |= (namespace_flags & CLONE_NEWNS) != 0;
+  state->emulated_network_namespace |= (namespace_flags & CLONE_NEWNET) != 0;
+  state->emulated_user_namespace |= (namespace_flags & CLONE_NEWUSER) != 0;
+}
+
 bool MaybeEmulateNamespaceSyscall(
     pid_t pid, TraceeState* state, user_pt_regs* regs) {
   if (state == nullptr || regs == nullptr) {
@@ -1001,9 +1049,7 @@ bool MaybeEmulateNamespaceSyscall(
       return false;
     }
 
-    state->emulated_mount_namespace |= (namespace_flags & CLONE_NEWNS) != 0;
-    state->emulated_network_namespace |= (namespace_flags & CLONE_NEWNET) != 0;
-    state->emulated_user_namespace |= (namespace_flags & CLONE_NEWUSER) != 0;
+    EnterEmulatedNamespaces(state, namespace_flags);
     regs->regs[0] &= ~kNamespaceCloneFlags;
     if (regs->regs[0] == 0) {
       SetEmulatedSyscallReturn(pid, state, regs, 0);
@@ -1019,9 +1065,8 @@ bool MaybeEmulateNamespaceSyscall(
       return false;
     }
 
-    state->emulated_mount_namespace |= (namespace_flags & CLONE_NEWNS) != 0;
-    state->emulated_network_namespace |= (namespace_flags & CLONE_NEWNET) != 0;
-    state->emulated_user_namespace |= (namespace_flags & CLONE_NEWUSER) != 0;
+    // The caller stays in its namespaces; only the new child enters them.
+    state->pending_clone_namespace_flags = namespace_flags;
     regs->regs[0] &= ~kNamespaceCloneFlags;
     SetRegs(pid, *regs);
     return false;
@@ -1041,9 +1086,7 @@ bool MaybeEmulateNamespaceSyscall(
     return false;
   }
 
-  state->emulated_mount_namespace |= (namespace_flags & CLONE_NEWNS) != 0;
-  state->emulated_network_namespace |= (namespace_flags & CLONE_NEWNET) != 0;
-  state->emulated_user_namespace |= (namespace_flags & CLONE_NEWUSER) != 0;
+  state->pending_clone_namespace_flags = namespace_flags;
   flags &= ~kNamespaceCloneFlags;
   WriteTraceeMemory(pid, regs->regs[0], &flags, sizeof(flags));
   return false;
@@ -2909,6 +2952,136 @@ int ChildTraceeMain(const std::string& extract_dst_path,
   return 126;
 }
 
+bool IsCrashSignal(int signal_number) {
+  switch (signal_number) {
+    case SIGABRT:
+    case SIGBUS:
+    case SIGFPE:
+    case SIGILL:
+    case SIGSEGV:
+    case SIGTRAP:
+      return true;
+    default:
+      return false;
+  }
+}
+
+// Formats an address as "path+0xoffset" using the tracee's mappings so it can
+// be symbolized against the mapped file.
+std::string DescribeTraceeAddress(pid_t pid, uint64_t address) {
+  char maps_path[64];
+  snprintf(maps_path, sizeof(maps_path), "/proc/%d/maps", pid);
+  FILE* maps = fopen(maps_path, "re");
+  if (maps == nullptr) {
+    return "?";
+  }
+  std::string description = "?";
+  char        line[PATH_MAX + 128];
+  while (fgets(line, sizeof(line), maps) != nullptr) {
+    unsigned long long start         = 0;
+    unsigned long long end           = 0;
+    unsigned long long offset        = 0;
+    int                path_position = 0;
+    if (sscanf(line, "%llx-%llx %*s %llx %*s %*s %n", &start, &end, &offset,
+            &path_position) != 3) {
+      continue;
+    }
+    if (address < start || address >= end) {
+      continue;
+    }
+    std::string path = line + path_position;
+    while (!path.empty() && (path.back() == '\n' || path.back() == ' ')) {
+      path.pop_back();
+    }
+    char buffer[64];
+    snprintf(buffer, sizeof(buffer), "+0x%llx", address - start + offset);
+    description = (path.empty() ? std::string("[anon]") : path) + buffer;
+    break;
+  }
+  fclose(maps);
+  return description;
+}
+
+void LogCrashContext(pid_t pid, int signal_number, const TraceeState& state) {
+  // Return addresses may carry pointer authentication codes.
+  constexpr uint64_t kAddressMask = (1ULL << 48) - 1;
+
+  siginfo_t  siginfo{};
+  const bool has_siginfo =
+      ptrace(PTRACE_GETSIGINFO, pid, nullptr, &siginfo) == 0;
+  user_pt_regs regs{};
+  if (!GetRegs(pid, &regs)) {
+    __android_log_print(ANDROID_LOG_WARN, kLogTag,
+        "crash pid=%d signal=%d: registers unavailable", pid, signal_number);
+    return;
+  }
+  __android_log_print(ANDROID_LOG_WARN, kLogTag,
+      "crash pid=%d signal=%d code=%d sender=%d addr=0x%llx", pid,
+      signal_number, has_siginfo ? siginfo.si_code : 0,
+      has_siginfo ? siginfo.si_pid : 0,
+      has_siginfo ? static_cast<unsigned long long>(
+                        reinterpret_cast<uintptr_t>(siginfo.si_addr)) :
+                    0ULL);
+  __android_log_print(ANDROID_LOG_WARN, kLogTag, "crash pid=%d pc=0x%llx %s",
+      pid, static_cast<unsigned long long>(regs.pc),
+      DescribeTraceeAddress(pid, regs.pc).c_str());
+  const uint64_t link = regs.regs[30] & kAddressMask;
+  __android_log_print(ANDROID_LOG_WARN, kLogTag, "crash pid=%d lr=0x%llx %s",
+      pid, static_cast<unsigned long long>(link),
+      DescribeTraceeAddress(pid, link).c_str());
+  for (size_t i = 0; i < 31; i += 4) {
+    const auto reg = [&](size_t index) {
+      return static_cast<unsigned long long>(index < 31 ? regs.regs[index] : 0);
+    };
+    __android_log_print(ANDROID_LOG_WARN, kLogTag,
+        "crash pid=%d x%zu=0x%llx x%zu=0x%llx x%zu=0x%llx x%zu=0x%llx", pid, i,
+        reg(i), i + 1, reg(i + 1), i + 2, reg(i + 2), i + 3, reg(i + 3));
+  }
+
+  uint64_t frame = regs.regs[29];
+  for (size_t depth = 0; depth < 32 && frame != 0; ++depth) {
+    uint64_t record[2]{};
+    if (!ReadTraceeMemory(pid, frame, record, sizeof(record))) {
+      break;
+    }
+    const uint64_t return_address = record[1] & kAddressMask;
+    if (return_address == 0) {
+      break;
+    }
+    __android_log_print(ANDROID_LOG_WARN, kLogTag,
+        "crash pid=%d #%zu 0x%llx %s", pid, depth,
+        static_cast<unsigned long long>(return_address),
+        DescribeTraceeAddress(pid, return_address).c_str());
+    if (record[0] <= frame) {
+      break;
+    }
+    frame = record[0];
+  }
+
+  const size_t count =
+      std::min(state.recent_syscall_count, kSyscallHistorySize);
+  for (size_t i = 0; i < count; ++i) {
+    const SyscallRecord& record =
+        state.recent_syscalls[(state.recent_syscall_count - count + i) %
+                              kSyscallHistorySize];
+    char result[32] = "pending";
+    if (record.finished) {
+      snprintf(result, sizeof(result), "%lld",
+          static_cast<long long>(record.result));
+    }
+    __android_log_print(ANDROID_LOG_WARN, kLogTag,
+        "crash pid=%d syscall[%zu] nr=%llu args=0x%llx,0x%llx,0x%llx,0x%llx,"
+        "0x%llx,0x%llx result=%s",
+        pid, i, static_cast<unsigned long long>(record.number),
+        static_cast<unsigned long long>(record.args[0]),
+        static_cast<unsigned long long>(record.args[1]),
+        static_cast<unsigned long long>(record.args[2]),
+        static_cast<unsigned long long>(record.args[3]),
+        static_cast<unsigned long long>(record.args[4]),
+        static_cast<unsigned long long>(record.args[5]), result);
+  }
+}
+
 void ResumeSyscall(pid_t pid, int signal_number) {
   if (ptrace(PTRACE_SYSCALL, pid, nullptr, signal_number) != 0) {
     __android_log_print(ANDROID_LOG_WARN, kLogTag,
@@ -2971,6 +3144,9 @@ bool SuppressBlockedSyscall(pid_t pid, TraceeState* state) {
                                     static_cast<uint64_t>(-ENOSYS);
 
   regs.regs[0] = return_value;
+  if (state != nullptr) {
+    RecordSyscallResult(state, static_cast<int64_t>(return_value));
+  }
   if (!SetRegs(pid, regs)) {
     __android_log_print(ANDROID_LOG_WARN, kLogTag,
         "Failed to set SIGSYS result for pid=%d", pid);
@@ -3297,7 +3473,14 @@ int TracerMain(const std::string& extract_dst_path,
         syscall_direction_known = true;
       }
 
+      if (!is_syscall_entry) {
+        // Clone events arrive before the caller's exit stop.
+        state.pending_clone_namespace_flags = 0;
+      }
+
       if (state.has_emulated_return && !is_syscall_entry) {
+        RecordSyscallResult(
+            &state, static_cast<int64_t>(state.emulated_return));
         RestoreOpenPermission(&state);
         ApplyEmulatedSyscallReturn(pid, &state);
         const andlify::ProcessOwner updated{pid, state.real_uid,
@@ -3318,6 +3501,11 @@ int TracerMain(const std::string& extract_dst_path,
       }
 
       if (has_regs) {
+        if (is_syscall_entry) {
+          RecordSyscallEntry(&state, regs);
+        } else {
+          RecordSyscallResult(&state, static_cast<int64_t>(regs.regs[0]));
+        }
         if (!is_syscall_entry) {
           RestoreOpenPermission(&state);
           if (!andlify::FinishFileOperation(pid,
@@ -3413,7 +3601,11 @@ int TracerMain(const std::string& extract_dst_path,
           child_state.pending_open_permission_path.clear();
           child_state.pending_open_permission_mode = 0;
           child_state.pending_executable.reset();
-          child_state.pending_file = {};
+          child_state.pending_file                  = {};
+          child_state.pending_clone_namespace_flags = 0;
+          child_state.recent_syscall_count          = 0;
+          EnterEmulatedNamespaces(
+              &child_state, state.pending_clone_namespace_flags);
           ownership->RegisterProcess({static_cast<int32_t>(new_pid),
               child_state.real_uid, child_state.effective_uid,
               child_state.real_gid, child_state.effective_gid});
@@ -3510,6 +3702,9 @@ int TracerMain(const std::string& extract_dst_path,
 
     __android_log_print(ANDROID_LOG_VERBOSE, kLogTag, "pid=%d signal stop=%d",
         pid, signal_number);
+    if (IsCrashSignal(signal_number)) {
+      LogCrashContext(pid, signal_number, state);
+    }
     ResumeSyscall(pid, signal_number);
   }
 
