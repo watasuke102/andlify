@@ -130,7 +130,8 @@ int CheckFileAccess(OwnershipStore& store, const std::string& path,
 
 bool PrepareFileOperation(pid_t pid, uint64_t syscall, uint64_t* a,
     const FileCredentials& c, OwnershipStore& store, const ResolveFile& resolve,
-    PendingFile* pending, int64_t* result) {
+    PendingFile* pending, int64_t* result,
+    const std::string& unix_socket_path) {
   *pending          = {};
   int      path_arg = -1;
   int      dir_arg  = -1;
@@ -143,8 +144,12 @@ bool PrepareFileOperation(pid_t pid, uint64_t syscall, uint64_t* a,
         !ReadTraceeMemory(pid, a[1], &address, a[2]) ||
         address.sun_family != AF_UNIX || !address.sun_path[0])
       return false;
-    std::string socket_path(
-        address.sun_path, strnlen(address.sun_path, sizeof(address.sun_path)));
+    // An alias in sun_path stands in for a target path that does not fit.
+    std::string socket_path =
+        !unix_socket_path.empty() ?
+            unix_socket_path :
+            std::string(address.sun_path,
+                strnlen(address.sun_path, sizeof(address.sun_path)));
     if (!Managed(store, socket_path))
       return false;
     int       error = Search(store, socket_path, c);

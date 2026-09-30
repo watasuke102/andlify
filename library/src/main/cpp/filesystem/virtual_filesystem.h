@@ -24,7 +24,8 @@ struct PendingFile {
 using ResolveFile = std::function<bool(int, int, bool, std::string*)>;
 bool PrepareFileOperation(pid_t pid, uint64_t syscall, uint64_t* args,
     const FileCredentials& credentials, OwnershipStore& store,
-    const ResolveFile& resolve, PendingFile* pending, int64_t* result);
+    const ResolveFile& resolve, PendingFile* pending, int64_t* result,
+    const std::string& unix_socket_path = {});
 bool FinishFileOperation(pid_t pid, int64_t result, OwnershipStore& store,
     const FileCredentials& credentials, PendingFile* pending);
 int  CheckFileAccess(OwnershipStore& store, const std::string& path,

@@ -240,6 +240,11 @@ struct TraceeState {
   std::string                        emulated_new_root;
   std::string                        emulated_old_root;
   std::string                        emulated_mountinfo_path;
+  // Short rootfs path substituted for a Unix socket path that exceeds
+  // sun_path after rewriting; bind renames it to the target, others unlink.
+  std::string                        unix_socket_alias_path;
+  std::string                        unix_socket_alias_target;
+  bool                               unix_socket_alias_bind       = false;
   mode_t                             pending_open_permission_mode = 0;
   andlify::PendingFile               pending_file;
   andlify::ProcessOwner              published_identity;
@@ -2631,7 +2636,8 @@ bool HandleVirtualFiles(pid_t pid, const std::string& root,
   uint64_t arguments[6];
   std::copy_n(regs->regs, 6, arguments);
   if (!andlify::PrepareFileOperation(pid, regs->regs[8], arguments, credentials,
-          *ownership, resolve, &state->pending_file, &result)) {
+          *ownership, resolve, &state->pending_file, &result,
+          state->unix_socket_alias_target)) {
     if (!std::equal(arguments, arguments + 6, regs->regs)) {
       std::copy_n(arguments, 6, regs->regs);
       SetRegs(pid, *regs);
@@ -2851,8 +2857,96 @@ void RewritePathArgumentsIfNeeded(pid_t pid,
   }
 }
 
-void RewriteSockaddrIfNeeded(
-    pid_t pid, const std::string& normalized_rootfs, user_pt_regs* regs) {
+void RemoveUnixSocketAlias(TraceeState* state) {
+  if (state->unix_socket_alias_path.empty()) {
+    return;
+  }
+  unlink(state->unix_socket_alias_path.c_str());
+  state->unix_socket_alias_path.clear();
+  state->unix_socket_alias_target.clear();
+  state->unix_socket_alias_bind = false;
+}
+
+// Returns false when the syscall result was emulated instead.
+bool CreateUnixSocketAlias(pid_t pid, const std::string& normalized_rootfs,
+    uint64_t syscall_number, const std::string& target, TraceeState* state,
+    user_pt_regs* regs) {
+  static uint64_t   alias_counter = 0;
+  const std::string alias = normalized_rootfs + "/tmp/.andlify-socket-" +
+                            std::to_string(pid) + "-" +
+                            std::to_string(alias_counter++);
+  if (alias.size() >= sizeof(sockaddr_un{}.sun_path)) {
+    __android_log_print(ANDROID_LOG_WARN, kLogTag,
+        "Unix socket alias path too long: %s", alias.c_str());
+    return true;
+  }
+  RemoveUnixSocketAlias(state);
+  unlink(alias.c_str());
+
+  const bool bind = syscall_number == kSysBind;
+  if (bind) {
+    // The socket is already bound when renaming fails, so reject early.
+    struct stat       st{};
+    const size_t      slash  = target.find_last_of('/');
+    const std::string parent = slash == 0 ? "/" : target.substr(0, slash);
+    int               error  = 0;
+    if (lstat(target.c_str(), &st) == 0) {
+      error = EADDRINUSE;
+    } else if (stat(parent.c_str(), &st) != 0) {
+      error = errno;
+    } else if (!S_ISDIR(st.st_mode)) {
+      error = ENOTDIR;
+    }
+    if (error != 0) {
+      SetEmulatedSyscallReturn(pid, state, regs, -error);
+      return false;
+    }
+  } else if (symlink(target.c_str(), alias.c_str()) != 0) {
+    __android_log_print(ANDROID_LOG_WARN, kLogTag,
+        "Failed to create Unix socket alias %s -> %s: %s", alias.c_str(),
+        target.c_str(), strerror(errno));
+    return true;
+  }
+  state->unix_socket_alias_path   = alias;
+  state->unix_socket_alias_target = target;
+  state->unix_socket_alias_bind   = bind;
+  return true;
+}
+
+// Must run before FinishFileOperation, which records the bound socket owner
+// at its target path.
+void FinishUnixSocketAlias(pid_t pid, TraceeState* state, user_pt_regs* regs) {
+  if (state->unix_socket_alias_path.empty()) {
+    return;
+  }
+  const int64_t result = static_cast<int64_t>(regs->regs[0]);
+  // ERESTARTSYS..ERESTART_RESTARTBLOCK re-enter with the alias sockaddr.
+  if (result <= -512 && result >= -516) {
+    return;
+  }
+  if (state->unix_socket_alias_bind && result == 0) {
+    if (syscall(SYS_renameat2, AT_FDCWD, state->unix_socket_alias_path.c_str(),
+            AT_FDCWD, state->unix_socket_alias_target.c_str(),
+            RENAME_NOREPLACE) == 0) {
+      state->unix_socket_alias_path.clear();
+      state->unix_socket_alias_target.clear();
+      state->unix_socket_alias_bind = false;
+      return;
+    }
+    const int error = errno;
+    __android_log_print(ANDROID_LOG_WARN, kLogTag,
+        "Failed to move Unix socket %s -> %s: %s",
+        state->unix_socket_alias_path.c_str(),
+        state->unix_socket_alias_target.c_str(), strerror(error));
+    regs->regs[0] = static_cast<uint64_t>(
+        -static_cast<int64_t>(error == EEXIST ? EADDRINUSE : error));
+    SetRegs(pid, *regs);
+  }
+  RemoveUnixSocketAlias(state);
+}
+
+void RewriteSockaddrIfNeeded(pid_t pid, const std::string& normalized_rootfs,
+    TraceeState* state, user_pt_regs* regs, bool is_syscall_entry) {
   const uint64_t syscall_number     = regs->regs[8];
   int            sockaddr_arg_index = -1;
   int            addrlen_arg_index  = -1;
@@ -2930,12 +3024,28 @@ void RewriteSockaddrIfNeeded(
       static_cast<unsigned long long>(syscall_number), original_path.c_str(),
       rewritten_path.c_str());
 
-  const size_t new_addrlen = path_offset + rewritten_path.size() + 1;
-  if (new_addrlen > sizeof(sockaddr_un)) {
-    __android_log_print(
-        ANDROID_LOG_WARN, kLogTag, "rewritten unix socket path too long");
-    return;
+  std::string sun_path = rewritten_path;
+  if (path_offset + sun_path.size() + 1 > sizeof(sockaddr_un)) {
+    // Clients such as VS Code size their paths to the kernel limit, which the
+    // rootfs prefix then exceeds.
+    if (!is_syscall_entry) {
+      return;
+    }
+    if (!CreateUnixSocketAlias(pid, normalized_rootfs, syscall_number,
+            rewritten_path, state, regs)) {
+      return;
+    }
+    if (state->unix_socket_alias_path.empty()) {
+      __android_log_print(
+          ANDROID_LOG_WARN, kLogTag, "rewritten unix socket path too long");
+      return;
+    }
+    sun_path = state->unix_socket_alias_path;
+    __android_log_print(ANDROID_LOG_VERBOSE, kLogTag,
+        "unix socket alias pid=%d %s -> %s", pid, sun_path.c_str(),
+        rewritten_path.c_str());
   }
+  const size_t new_addrlen = path_offset + sun_path.size() + 1;
 
   const uint64_t scratch_address =
       regs->sp > kStackScratchOffset ? regs->sp - kStackScratchOffset : 0;
@@ -2945,8 +3055,7 @@ void RewriteSockaddrIfNeeded(
 
   sockaddr_un rewritten_address{};
   rewritten_address.sun_family = family;
-  memcpy(rewritten_address.sun_path, rewritten_path.c_str(),
-      rewritten_path.size() + 1);
+  memcpy(rewritten_address.sun_path, sun_path.c_str(), sun_path.size() + 1);
   if (!WriteTraceeMemory(
           pid, scratch_address, &rewritten_address, new_addrlen)) {
     return;
@@ -3468,6 +3577,7 @@ int TracerMain(const std::string& extract_dst_path,
       __android_log_print(ANDROID_LOG_INFO, kLogTag, "pid=%d exited status=%d",
           pid, WEXITSTATUS(wait_status));
       tracked_pids.erase(pid);
+      RemoveUnixSocketAlias(&states[pid]);
       if (!states[pid].emulated_mountinfo_path.empty()) {
         unlink(states[pid].emulated_mountinfo_path.c_str());
       }
@@ -3479,6 +3589,7 @@ int TracerMain(const std::string& extract_dst_path,
       __android_log_print(ANDROID_LOG_WARN, kLogTag, "pid=%d killed signal=%d",
           pid, WTERMSIG(wait_status));
       tracked_pids.erase(pid);
+      RemoveUnixSocketAlias(&states[pid]);
       if (!states[pid].emulated_mountinfo_path.empty()) {
         unlink(states[pid].emulated_mountinfo_path.c_str());
       }
@@ -3551,6 +3662,7 @@ int TracerMain(const std::string& extract_dst_path,
         RecordSyscallResult(
             &state, static_cast<int64_t>(state.emulated_return));
         RestoreOpenPermission(&state);
+        RemoveUnixSocketAlias(&state);
         ApplyEmulatedSyscallReturn(pid, &state);
         const andlify::ProcessOwner updated{pid, state.real_uid,
             state.effective_uid, state.real_gid, state.effective_gid};
@@ -3577,6 +3689,7 @@ int TracerMain(const std::string& extract_dst_path,
         }
         if (!is_syscall_entry) {
           RestoreOpenPermission(&state);
+          FinishUnixSocketAlias(pid, &state, &regs);
           if (!andlify::FinishFileOperation(pid,
                   static_cast<int64_t>(regs.regs[0]), *ownership,
                   {state.fs_uid, state.fs_gid, state.supplementary_groups,
@@ -3598,7 +3711,8 @@ int TracerMain(const std::string& extract_dst_path,
           RewritePeerCredentials(pid, app_uid, app_gid, states, regs);
         }
         if (is_syscall_entry || !syscall_direction_known) {
-          RewriteSockaddrIfNeeded(pid, normalized_rootfs, &regs);
+          RewriteSockaddrIfNeeded(
+              pid, normalized_rootfs, &state, &regs, is_syscall_entry);
         }
         if (is_syscall_entry && state.retrying_openat2 &&
             regs.regs[8] == kSysOpenat) {
@@ -3667,6 +3781,9 @@ int TracerMain(const std::string& extract_dst_path,
           child_state.pending_openat2_retry = false;
           child_state.retrying_openat2      = false;
           child_state.emulated_mountinfo_path.clear();
+          child_state.unix_socket_alias_path.clear();
+          child_state.unix_socket_alias_target.clear();
+          child_state.unix_socket_alias_bind = false;
           child_state.pending_open_permission_path.clear();
           child_state.pending_open_permission_mode = 0;
           child_state.pending_executable.reset();
