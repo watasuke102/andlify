@@ -87,6 +87,7 @@ constexpr uint64_t    kSysRenameat2           = 276;
 constexpr uint64_t    kSysStatx               = 291;
 constexpr uint64_t    kSysOpenat2             = 437;
 constexpr uint64_t    kSysFaccessat2          = 439;
+constexpr uint64_t    kSysMountSetattr        = 442;
 constexpr uint64_t    kSysExecve              = 221;
 constexpr uint64_t    kSysExecveat            = 281;
 constexpr uint64_t    kSysCapset              = 91;
@@ -311,6 +312,25 @@ std::string MapEmulatedOldRootInRootfs(
   }
   const std::string mapped = path.substr(old_root_in_rootfs.size());
   return mapped.empty() ? "/" : mapped;
+}
+
+// After pivot_root, rootfs paths are seen relative to the emulated new root,
+// and paths outside it appear beneath the emulated old root.
+std::string MapRootfsPathToEmulatedRoot(
+    const TraceeState& state, const std::string& path) {
+  if (state.emulated_new_root.empty() || state.emulated_new_root == "/") {
+    return path;
+  }
+  if (path == state.emulated_new_root) {
+    return "/";
+  }
+  if (path.rfind(state.emulated_new_root + "/", 0) == 0) {
+    return path.substr(state.emulated_new_root.size());
+  }
+  if (state.emulated_old_root.empty()) {
+    return path;
+  }
+  return path == "/" ? state.emulated_old_root : state.emulated_old_root + path;
 }
 
 std::string ResolveEmulatedBindMounts(
@@ -1059,9 +1079,10 @@ bool MaybeEmulateProcReadlink(pid_t pid, const std::string& normalized_rootfs,
     }
     result.assign(buffer, length);
     if (result == normalized_rootfs) {
-      result = "/";
+      result = MapRootfsPathToEmulatedRoot(*state, "/");
     } else if (result.rfind(normalized_rootfs + "/", 0) == 0) {
-      result.erase(0, normalized_rootfs.size());
+      result = MapRootfsPathToEmulatedRoot(
+          *state, result.substr(normalized_rootfs.size()));
     }
   }
   if (regs->regs[3] == 0) {
@@ -1356,6 +1377,9 @@ bool MaybeEmulateMountNamespaceOperation(pid_t pid,
       return true;
     }
     case kSysUmount2:
+    // Mount attributes are not tracked, so changing them only has to succeed
+    // like the remount performed through mount().
+    case kSysMountSetattr:
       SetEmulatedSyscallReturn(pid, state, regs, 0);
       return true;
     case kSysPivotRoot: {
@@ -1461,8 +1485,16 @@ void RedirectEmulatedMountInfo(pid_t pid, const std::string& normalized_rootfs,
 
   std::string content  = "1 0 0:1 / / rw,nosuid,nodev - tmpfs andlify rw\n";
   int         mount_id = 2;
-  for (const std::string& mount_point : state->emulated_mount_points) {
-    if (mount_point == "/") {
+  std::unordered_set<std::string> listed_mount_points{"/"};
+  for (const std::string& recorded_mount_point : state->emulated_mount_points) {
+    // Report virtual mount points as seen from the emulated root, matching
+    // the paths returned by readlink of /proc/self/fd.
+    const std::string mount_point =
+        recorded_mount_point == normalized_rootfs ||
+                recorded_mount_point.rfind(normalized_rootfs + "/", 0) == 0 ?
+            recorded_mount_point :
+            MapRootfsPathToEmulatedRoot(*state, recorded_mount_point);
+    if (!listed_mount_points.insert(mount_point).second) {
       continue;
     }
     std::string escaped_path;
