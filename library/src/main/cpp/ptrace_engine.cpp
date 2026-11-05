@@ -3533,6 +3533,7 @@ int TracerMain(const std::string& extract_dst_path,
   prctl(PR_SET_PDEATHSIG, SIGKILL);
 
   std::string normalized_rootfs = NormalizeRootfsPrefix(extract_dst_path);
+  andlify::OwnershipStore::CloseInheritedDescriptors(normalized_rootfs);
   andlify::OwnershipStore owner_store;
   if (!owner_store.Open(normalized_rootfs, true)) {
     __android_log_print(ANDROID_LOG_ERROR, kLogTag,

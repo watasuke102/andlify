@@ -9,12 +9,15 @@
 #include <unistd.h>
 
 #include <cerrno>
+#include <climits>
+#include <cstdlib>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
 #include <limits>
 #include <new>
 #include <sstream>
+#include <string_view>
 
 #include "ownership_store_internal.h"
 #include "user_setup.h"
@@ -55,6 +58,35 @@ OwnershipStore::~OwnershipStore() {
     close(directory_fd_);
   if (lease_fd_ >= 0)
     close(lease_fd_);
+}
+
+void OwnershipStore::CloseInheritedDescriptors(const std::string& root) {
+  char* canonical = realpath(root.c_str(), nullptr);
+  if (!canonical)
+    return;
+  const std::string directory = std::string(canonical) + ".andlify-owners";
+  free(canonical);
+  DIR* fds = opendir("/proc/self/fd");
+  if (!fds)
+    return;
+  std::vector<int> targets;
+  while (const dirent* entry = readdir(fds)) {
+    char*      end = nullptr;
+    const long fd  = strtol(entry->d_name, &end, 10);
+    if (*end != '\0' || fd < 0 || fd == dirfd(fds))
+      continue;
+    char       target[PATH_MAX];
+    const auto length =
+        readlinkat(dirfd(fds), entry->d_name, target, sizeof(target) - 1);
+    if (length < 0)
+      continue;
+    target[length] = '\0';
+    if (target == directory ||
+        std::string_view(target).rfind(directory + "/", 0) == 0)
+      targets.push_back(static_cast<int>(fd));
+  }
+  closedir(fds);
+  for (int fd : targets) close(fd);
 }
 
 bool OwnershipStore::Open(const std::string& root, bool prepare_user) {

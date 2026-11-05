@@ -35,6 +35,11 @@ class OwnershipStore {
   OwnershipStore(const OwnershipStore&)            = delete;
   OwnershipStore& operator=(const OwnershipStore&) = delete;
   bool            Open(const std::string& root, bool prepare_user = false);
+  // A process forked while another thread used a store inherits its
+  // descriptors, and flock() locks follow descriptors, so the child would keep
+  // holding those locks and deadlock in Open(). Call this in such a child
+  // before Open() to close the inherited descriptors of the store for `root`.
+  static void     CloseInheritedDescriptors(const std::string& root);
   bool TerminalOwner(const std::string& path, bool follow, FileOwner* owner,
       const FileOwner* replacement = nullptr);
   bool LookupTerminal(const struct stat& info, FileOwner* owner);
