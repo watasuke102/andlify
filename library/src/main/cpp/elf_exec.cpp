@@ -70,6 +70,14 @@ struct RemoteSyscalls {
       if (waited < 0 || !WIFSTOPPED(status)) {
         return waited < 0 ? -errno : -ESRCH;
       }
+      // The tracee's syscall filter also stops injected syscalls before they
+      // run, with pc already past the svc.
+      if (static_cast<unsigned>(status) >> 16U == PTRACE_EVENT_SECCOMP) {
+        if (ptrace(PTRACE_CONT, pid, nullptr, nullptr) != 0) {
+          return -errno;
+        }
+        continue;
+      }
       if (ptrace(PTRACE_GETREGSET, pid, NT_PRSTATUS, &io) != 0) {
         return -errno;
       }

@@ -6,10 +6,13 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <limits.h>
+#include <linux/audit.h>
+#include <linux/filter.h>
 #include <linux/memfd.h>
 #include <linux/netlink.h>
 #include <linux/ptrace.h>
 #include <linux/sched.h>
+#include <linux/seccomp.h>
 #include <linux/stat.h>
 #include <net/if.h>
 #include <signal.h>
@@ -127,6 +130,33 @@ constexpr uint64_t    kSysGetgid              = 176;
 constexpr uint64_t    kSysGetegid             = 177;
 constexpr uint64_t    kSysIoctl               = 29;
 constexpr uint64_t    kSysGetcwd              = 17;
+constexpr uint64_t    kSysTruncate            = 45;
+constexpr uint64_t    kSysFtruncate           = 46;
+constexpr uint64_t    kSysFchdir              = 50;
+constexpr uint64_t    kSysFchmod              = 52;
+constexpr uint64_t    kSysFchown              = 55;
+constexpr uint64_t    kSysUmask               = 166;
+constexpr uint64_t    kSysFchmodat2           = 452;
+// Every syscall inspected at entry or exit, including those handled by
+// PrepareFileOperation. The others never stop the tracee, so a handler for a
+// new syscall must also add it here. getpid and eventfd2 appear only as
+// replacements for emulated syscalls.
+constexpr uint64_t    kTracedSyscalls[]       = {kSysSetxattr, kSysLsetxattr,
+    kSysGetxattr, kSysLgetxattr, kSysListxattr, kSysLlistxattr, kSysRemovexattr,
+    kSysLremovexattr, kSysMknodat, kSysClose, kSysUmount2, kSysMount,
+    kSysPivotRoot, kSysMkdirat, kSysUnlinkat, kSysSymlinkat, kSysLinkat,
+    kSysRenameat, kSysStatfs, kSysTruncate, kSysFtruncate, kSysFaccessat,
+    kSysChdir, kSysFchdir, kSysFchmod, kSysFchmodat, kSysFchownat, kSysFchown,
+    kSysOpenat, kSysReadlinkat, kSysNewfstatat, kSysFstat, kSysUtimensat,
+    kSysRenameat2, kSysStatx, kSysOpenat2, kSysFaccessat2, kSysFchmodat2,
+    kSysMountSetattr, kSysExecve, kSysExecveat, kSysCapset, kSysSocket,
+    kSysBind, kSysAccept, kSysConnect, kSysSendto, kSysRecvfrom, kSysGetsockopt,
+    kSysSendmsg, kSysRecvmsg, kSysAccept4, kSysPrlimit64, kSysSetregid,
+    kSysSetgid, kSysSetreuid, kSysSetuid, kSysSetresuid, kSysGetresuid,
+    kSysSetresgid, kSysGetresgid, kSysSetfsuid, kSysSetfsgid, kSysGetgroups,
+    kSysSetgroups, kSysGetrlimit, kSysSetrlimit, kSysPrctl, kSysClone,
+    kSysUnshare, kSysClone3, kSysGetuid, kSysGeteuid, kSysGetgid, kSysGetegid,
+    kSysIoctl, kSysGetcwd, kSysUmask};
 constexpr uint64_t    kTcgets                 = 0x5401;
 constexpr uint64_t    kTcsets                 = 0x5402;
 constexpr uint64_t    kTcsetsw                = 0x5403;
@@ -217,8 +247,22 @@ struct SyscallRecord {
 
 constexpr size_t kSyscallHistorySize = 32;
 
+// A traced syscall that another seccomp filter traps never reaches our seccomp
+// stop, so it is executed again from a syscall-entry-stop. The retry is
+// abandoned when the same call is trapped again.
+enum class BlockedSyscallRetry {
+  kNone,
+  kAwaitingEntry,
+  kInFlight,
+  kExited,
+};
+
 struct TraceeState {
   bool                               expect_entry                  = true;
+  BlockedSyscallRetry                blocked_syscall_retry         = {};
+  // Identifies the second entry stop that a retried syscall reports when it
+  // reaches our seccomp filter after its syscall-entry-stop.
+  uint64_t                           entry_stop_pc                 = 0;
   bool                               options_applied               = false;
   bool                               has_emulated_return           = false;
   bool                               emulated_mount_namespace      = false;
@@ -755,8 +799,52 @@ bool ShouldFollowFinalSymlink(
 bool ApplyTraceOptions(pid_t pid) {
   const long options = PTRACE_O_TRACESYSGOOD | PTRACE_O_TRACEFORK |
                        PTRACE_O_TRACEVFORK | PTRACE_O_TRACECLONE |
-                       PTRACE_O_TRACEEXEC | PTRACE_O_EXITKILL;
+                       PTRACE_O_TRACEEXEC | PTRACE_O_TRACESECCOMP |
+                       PTRACE_O_EXITKILL;
   return ptrace(PTRACE_SETOPTIONS, pid, nullptr, options) == 0;
+}
+
+bool IsTracedSyscall(uint64_t syscall_number) {
+  return std::find(std::begin(kTracedSyscalls), std::end(kTracedSyscalls),
+             syscall_number) != std::end(kTracedSyscalls);
+}
+
+// Stopping at every syscall entry and exit makes each one cost several context
+// switches, so only syscalls the tracer handles stop the tracee. The filter is
+// inherited by every descendant and survives execve.
+bool InstallSyscallFilter() {
+  std::vector<sock_filter> program;
+  program.push_back(
+      BPF_STMT(BPF_LD | BPF_W | BPF_ABS, offsetof(struct seccomp_data, arch)));
+  program.push_back(
+      BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, AUDIT_ARCH_AARCH64, 1, 0));
+  program.push_back(BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_TRACE));
+  program.push_back(
+      BPF_STMT(BPF_LD | BPF_W | BPF_ABS, offsetof(struct seccomp_data, nr)));
+  const size_t count = std::size(kTracedSyscalls);
+  static_assert(std::size(kTracedSyscalls) <= UINT8_MAX);
+  for (size_t i = 0; i < count; ++i) {
+    // Jumps to the SECCOMP_RET_TRACE after the trailing SECCOMP_RET_ALLOW.
+    program.push_back(BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K,
+        static_cast<uint32_t>(kTracedSyscalls[i]),
+        static_cast<uint8_t>(count - i), 0));
+  }
+  program.push_back(BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ALLOW));
+  program.push_back(BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_TRACE));
+
+  const sock_fprog filter{
+      .len    = static_cast<unsigned short>(program.size()),
+      .filter = program.data(),
+  };
+  // An unprivileged process may install a filter only without new privileges;
+  // setuid execution is emulated by the tracer instead.
+  if (prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) != 0 ||
+      prctl(PR_SET_SECCOMP, SECCOMP_MODE_FILTER, &filter) != 0) {
+    __android_log_print(ANDROID_LOG_ERROR, kLogTag,
+        "Failed to install syscall filter: %s", strerror(errno));
+    return false;
+  }
+  return true;
 }
 
 bool ReadShebangInterpreter(const std::string& executable_path,
@@ -2399,6 +2487,13 @@ bool MaybeEmulatePrctlSyscall(
       regs->regs[0] == PR_SET_NO_NEW_PRIVS && regs->regs[1] == 1 &&
       regs->regs[2] == 0 && regs->regs[3] == 0 && regs->regs[4] == 0)
     state->no_new_privileges = true;
+  // The syscall filter sets the real flag for every tracee.
+  if (regs && regs->regs[8] == kSysPrctl &&
+      regs->regs[0] == PR_GET_NO_NEW_PRIVS && regs->regs[1] == 0 &&
+      regs->regs[2] == 0 && regs->regs[3] == 0 && regs->regs[4] == 0) {
+    SetEmulatedSyscallReturn(pid, state, regs, state->no_new_privileges);
+    return true;
+  }
   if (regs == nullptr || regs->regs[8] != kSysPrctl ||
       regs->regs[0] != PR_SET_DUMPABLE || regs->regs[1] != 0) {
     return false;
@@ -2570,7 +2665,7 @@ bool ApplyEmulatedSyscallReturn(pid_t pid, TraceeState* state) {
 bool HandleVirtualFiles(pid_t pid, const std::string& root,
     const std::unordered_map<pid_t, TraceeState>& states, TraceeState* state,
     user_pt_regs* regs) {
-  if (regs->regs[8] == 166)
+  if (regs->regs[8] == kSysUmask)
     state->file_umask = regs->regs[0] & 0777;
   const bool real_access =
       regs->regs[8] == kSysFaccessat ||
@@ -3126,6 +3221,10 @@ int ChildTraceeMain(const std::string& extract_dst_path,
     return 127;
   }
   raise(SIGSTOP);
+  // Filtered syscalls fail until the tracer enables PTRACE_O_TRACESECCOMP.
+  if (!InstallSyscallFilter()) {
+    return 127;
+  }
 
   const char* argv[] = {command_path_in_rootfs.c_str(), nullptr};
   execv(command_path_in_rootfs.c_str(), const_cast<char* const *>(argv));
@@ -3265,11 +3364,44 @@ void LogCrashContext(pid_t pid, int signal_number, const TraceeState& state) {
   }
 }
 
-void ResumeSyscall(pid_t pid, int signal_number) {
-  if (ptrace(PTRACE_SYSCALL, pid, nullptr, signal_number) != 0) {
-    __android_log_print(ANDROID_LOG_WARN, kLogTag,
-        "PTRACE_SYSCALL failed for pid=%d (%d)", pid, errno);
+// Syscall stops are requested only for the exit of a handled syscall and for
+// the entry of a retried one; seccomp stops cover every other entry.
+void ResumeTracee(pid_t pid, const TraceeState& state, int signal_number) {
+  const bool stop_at_syscall =
+      !state.expect_entry ||
+      state.blocked_syscall_retry == BlockedSyscallRetry::kAwaitingEntry;
+  if (ptrace(stop_at_syscall ? PTRACE_SYSCALL : PTRACE_CONT, pid, nullptr,
+          signal_number) != 0) {
+    __android_log_print(ANDROID_LOG_WARN, kLogTag, "%s failed for pid=%d (%d)",
+        stop_at_syscall ? "PTRACE_SYSCALL" : "PTRACE_CONT", pid, errno);
   }
+}
+
+// Re-executes a traced syscall that another seccomp filter trapped before our
+// seccomp stop, so its syscall-entry-stop can emulate or rewrite it.
+bool RetryBlockedSyscall(pid_t pid, TraceeState* state) {
+  siginfo_t siginfo{};
+  if (ptrace(PTRACE_GETSIGINFO, pid, nullptr, &siginfo) != 0 ||
+      siginfo.si_code != SYS_SECCOMP || siginfo.si_arch != AUDIT_ARCH_AARCH64 ||
+      siginfo.si_call_addr == nullptr ||
+      !IsTracedSyscall(static_cast<uint64_t>(siginfo.si_syscall))) {
+    return false;
+  }
+  user_pt_regs regs{};
+  if (!GetRegs(pid, &regs)) {
+    return false;
+  }
+  // The trap restored the arguments, and si_call_addr follows the svc.
+  regs.pc =
+      reinterpret_cast<uintptr_t>(siginfo.si_call_addr) - sizeof(uint32_t);
+  if (!SetRegs(pid, regs)) {
+    __android_log_print(ANDROID_LOG_WARN, kLogTag,
+        "Failed to retry blocked syscall for pid=%d", pid);
+    return false;
+  }
+  state->expect_entry          = true;
+  state->blocked_syscall_retry = BlockedSyscallRetry::kAwaitingEntry;
+  return true;
 }
 
 bool SuppressBlockedSyscall(pid_t pid, TraceeState* state) {
@@ -3587,7 +3719,7 @@ int TracerMain(const std::string& extract_dst_path,
     return 1;
   }
   states[tracee_pid].options_applied = true;
-  ResumeSyscall(tracee_pid, 0);
+  ResumeTracee(tracee_pid, states[tracee_pid], 0);
 
   while (!tracked_pids.empty()) {
     int   wait_status = 0;
@@ -3662,31 +3794,62 @@ int TracerMain(const std::string& extract_dst_path,
 
     const int      signal_number = WSTOPSIG(wait_status);
     const unsigned event         = static_cast<unsigned>(wait_status) >> 16U;
-    if (signal_number == (SIGTRAP | 0x80)) {
-      user_pt_regs        regs{};
-      const bool          has_regs                = GetRegs(pid, &regs);
-      bool                is_syscall_entry        = state.expect_entry;
-      bool                syscall_direction_known = false;
-      ptrace_syscall_info syscall_info{};
-      const long          syscall_info_size = ptrace(
-          PTRACE_GET_SYSCALL_INFO, pid, sizeof(syscall_info), &syscall_info);
-      if (syscall_info_size > 0 &&
-          (syscall_info.op == PTRACE_SYSCALL_INFO_ENTRY ||
-              syscall_info.op == PTRACE_SYSCALL_INFO_SECCOMP)) {
+    // The SIGSYS of a retried syscall that was trapped again directly follows
+    // its exit stop.
+    const bool     retried_syscall_exited =
+        state.blocked_syscall_retry == BlockedSyscallRetry::kExited;
+    if (retried_syscall_exited) {
+      state.blocked_syscall_retry = BlockedSyscallRetry::kNone;
+    }
+    const bool is_seccomp_stop =
+        signal_number == SIGTRAP && event == PTRACE_EVENT_SECCOMP;
+    if (signal_number == (SIGTRAP | 0x80) || is_seccomp_stop) {
+      user_pt_regs regs{};
+      const bool   has_regs                = GetRegs(pid, &regs);
+      bool         is_syscall_entry        = state.expect_entry;
+      bool         syscall_direction_known = false;
+      if (is_seccomp_stop) {
         is_syscall_entry        = true;
         syscall_direction_known = true;
-      } else if (syscall_info_size > 0 &&
-                 syscall_info.op == PTRACE_SYSCALL_INFO_EXIT) {
-        is_syscall_entry        = false;
-        syscall_direction_known = true;
-      } else if (has_regs && regs.regs[7] <= 1) {
-        // Alternating stops can desynchronize after clone or SIGSYS on kernels
-        // without GET_SYSCALL_INFO; arm64 exposes the stop direction in x7.
-        is_syscall_entry        = regs.regs[7] == 0;
-        syscall_direction_known = true;
+      } else {
+        ptrace_syscall_info syscall_info{};
+        const long          syscall_info_size = ptrace(
+            PTRACE_GET_SYSCALL_INFO, pid, sizeof(syscall_info), &syscall_info);
+        if (syscall_info_size > 0 &&
+            (syscall_info.op == PTRACE_SYSCALL_INFO_ENTRY ||
+                syscall_info.op == PTRACE_SYSCALL_INFO_SECCOMP)) {
+          is_syscall_entry        = true;
+          syscall_direction_known = true;
+        } else if (syscall_info_size > 0 &&
+                   syscall_info.op == PTRACE_SYSCALL_INFO_EXIT) {
+          is_syscall_entry        = false;
+          syscall_direction_known = true;
+        } else if (has_regs && regs.regs[7] <= 1) {
+          // Alternating stops can desynchronize after clone or SIGSYS on
+          // kernels without GET_SYSCALL_INFO; arm64 exposes the stop direction
+          // in x7.
+          is_syscall_entry        = regs.regs[7] == 0;
+          syscall_direction_known = true;
+        }
       }
 
-      if (!is_syscall_entry) {
+      if (is_syscall_entry && !state.expect_entry && has_regs &&
+          regs.pc == state.entry_stop_pc) {
+        // A syscall entered from a syscall-entry-stop stops again at our
+        // seccomp filter (before it on kernels older than 4.8).
+        ResumeTracee(pid, state, 0);
+        continue;
+      }
+      if (is_syscall_entry) {
+        state.entry_stop_pc = has_regs ? regs.pc : 0;
+        state.blocked_syscall_retry =
+            state.blocked_syscall_retry == BlockedSyscallRetry::kAwaitingEntry ?
+                BlockedSyscallRetry::kInFlight :
+                BlockedSyscallRetry::kNone;
+      } else {
+        if (state.blocked_syscall_retry == BlockedSyscallRetry::kInFlight) {
+          state.blocked_syscall_retry = BlockedSyscallRetry::kExited;
+        }
         // Clone events arrive before the caller's exit stop.
         state.pending_clone_namespace_flags = 0;
       }
@@ -3710,7 +3873,7 @@ int TracerMain(const std::string& extract_dst_path,
           state.published_identity = updated;
         }
         state.expect_entry = true;
-        ResumeSyscall(pid, 0);
+        ResumeTracee(pid, state, 0);
         continue;
       }
 
@@ -3793,7 +3956,7 @@ int TracerMain(const std::string& extract_dst_path,
         }
       }
       state.expect_entry = !is_syscall_entry;
-      ResumeSyscall(pid, 0);
+      ResumeTracee(pid, state, 0);
       continue;
     }
 
@@ -3808,6 +3971,8 @@ int TracerMain(const std::string& extract_dst_path,
           tracked_pids.insert(static_cast<pid_t>(new_pid));
           TraceeState child_state           = state;
           child_state.expect_entry          = true;
+          child_state.blocked_syscall_retry = BlockedSyscallRetry::kNone;
+          child_state.entry_stop_pc         = 0;
           child_state.options_applied       = false;
           child_state.has_emulated_return   = false;
           child_state.emulated_return       = 0;
@@ -3901,20 +4066,22 @@ int TracerMain(const std::string& extract_dst_path,
           state.expect_entry = true;
         }
       }
-      ResumeSyscall(pid, 0);
+      ResumeTracee(pid, state, 0);
       continue;
     }
 
     if (signal_number == SIGSTOP) {
-      ResumeSyscall(pid, 0);
+      ResumeTracee(pid, state, 0);
       continue;
     }
 
     if (signal_number == SIGSYS) {
-      if (SuppressBlockedSyscall(pid, &state)) {
-        ResumeSyscall(pid, 0);
+      if (!retried_syscall_exited && RetryBlockedSyscall(pid, &state)) {
+        ResumeTracee(pid, state, 0);
+      } else if (SuppressBlockedSyscall(pid, &state)) {
+        ResumeTracee(pid, state, 0);
       } else {
-        ResumeSyscall(pid, signal_number);
+        ResumeTracee(pid, state, signal_number);
       }
       continue;
     }
@@ -3924,7 +4091,7 @@ int TracerMain(const std::string& extract_dst_path,
     if (IsCrashSignal(signal_number)) {
       LogCrashContext(pid, signal_number, state);
     }
-    ResumeSyscall(pid, signal_number);
+    ResumeTracee(pid, state, signal_number);
   }
 
   return 0;
@@ -3992,6 +4159,9 @@ int StartChrootFunc(const std::string& extract_dst_path,
       return 127;
     }
     raise(SIGSTOP);
+    if (!InstallSyscallFilter()) {
+      return 127;
+    }
 
     return child_func();
   };
