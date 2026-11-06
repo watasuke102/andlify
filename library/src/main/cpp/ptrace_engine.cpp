@@ -263,6 +263,9 @@ struct TraceeState {
   // Identifies the second entry stop that a retried syscall reports when it
   // reaches our seccomp filter after its syscall-entry-stop.
   uint64_t                           entry_stop_pc                 = 0;
+  // Syscall a retried call executes after its entry handling; a SIGSYS for
+  // the same number right after its exit stop means it was trapped again.
+  int64_t                            retried_syscall_number        = -1;
   bool                               options_applied               = false;
   bool                               has_emulated_return           = false;
   bool                               emulated_mount_namespace      = false;
@@ -953,6 +956,21 @@ bool SetSyscallNumber(pid_t pid, user_pt_regs* regs, uint64_t syscall_number) {
 #endif
 
   return true;
+}
+
+// Returns the number the kernel executes, which differs from x8 when only the
+// register was rewritten.
+int64_t GetSyscallNumber(pid_t pid, const user_pt_regs& regs) {
+#if defined(__aarch64__)
+  int   syscall_no = 0;
+  iovec io_syscall{&syscall_no, sizeof(syscall_no)};
+  if (ptrace(PTRACE_GETREGSET, pid,
+          reinterpret_cast<void*>(0x404 /* NT_ARM_SYSTEM_CALL */),
+          &io_syscall) == 0) {
+    return syscall_no;
+  }
+#endif
+  return static_cast<int64_t>(regs.regs[8]);
 }
 
 void SetEmulatedSyscallReturn(
@@ -3379,12 +3397,18 @@ void ResumeTracee(pid_t pid, const TraceeState& state, int signal_number) {
 
 // Re-executes a traced syscall that another seccomp filter trapped before our
 // seccomp stop, so its syscall-entry-stop can emulate or rewrite it.
-bool RetryBlockedSyscall(pid_t pid, TraceeState* state) {
+bool RetryBlockedSyscall(
+    pid_t pid, TraceeState* state, bool retried_syscall_exited) {
   siginfo_t siginfo{};
   if (ptrace(PTRACE_GETSIGINFO, pid, nullptr, &siginfo) != 0 ||
       siginfo.si_code != SYS_SECCOMP || siginfo.si_arch != AUDIT_ARCH_AARCH64 ||
       siginfo.si_call_addr == nullptr ||
       !IsTracedSyscall(static_cast<uint64_t>(siginfo.si_syscall))) {
+    return false;
+  }
+  // Another trapped syscall can also directly follow a retried one.
+  if (retried_syscall_exited &&
+      siginfo.si_syscall == state->retried_syscall_number) {
     return false;
   }
   user_pt_regs regs{};
@@ -3955,6 +3979,10 @@ int TracerMain(const std::string& extract_dst_path,
           RewriteStatOwnershipIfNeeded(pid, app_uid, app_gid, regs);
         }
       }
+      if (is_syscall_entry &&
+          state.blocked_syscall_retry == BlockedSyscallRetry::kInFlight) {
+        state.retried_syscall_number = GetSyscallNumber(pid, regs);
+      }
       state.expect_entry = !is_syscall_entry;
       ResumeTracee(pid, state, 0);
       continue;
@@ -4076,7 +4104,7 @@ int TracerMain(const std::string& extract_dst_path,
     }
 
     if (signal_number == SIGSYS) {
-      if (!retried_syscall_exited && RetryBlockedSyscall(pid, &state)) {
+      if (RetryBlockedSyscall(pid, &state, retried_syscall_exited)) {
         ResumeTracee(pid, state, 0);
       } else if (SuppressBlockedSyscall(pid, &state)) {
         ResumeTracee(pid, state, 0);
